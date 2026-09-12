@@ -1,4 +1,4 @@
-# Multiple Class Race
+# Multiple Class Race For Assetto Corsa
 
 A CSP Lua app for Assetto Corsa that provides class-based position tracking and gap timing for multi-class races.
 
@@ -38,7 +38,7 @@ The config window opens automatically in the main menu. From here you can:
 - **Verify** — Check that all cars on the grid are assigned to a class
 - **Remove** — Remove a class and unassign its cars
 
-<!-- [screenshot: adding a class in config panel] -->
+<img width="494" height="307" alt="image" src="https://github.com/user-attachments/assets/758715dc-2458-4b38-ace4-972b48bdcd74" />
 
 ### Leaderboard HUD
 
@@ -51,7 +51,7 @@ The leaderboard overlay shows during your session:
 | **CLASS** | Position within your class |
 | **Gap** | Time gap to class car ahead (+) and behind (-) |
 
-<!-- [screenshot: leaderboard HUD during race] -->
+<img width="317" height="183" alt="image" src="https://github.com/user-attachments/assets/95ea3d53-74e8-49f1-98a4-f809e8fd29a1" />
 
 ## How Classes Work
 
@@ -62,6 +62,8 @@ Classes are **not auto-detected**. To set up classes:
 3. Click **Add Class** — the app matches cars whose tags, class field, or name match your entry (case-insensitive) and assigns them
 4. Use **Verify** to confirm every car belongs to a class
 5. **Remove** a class to unassign its cars
+
+<img width="848" height="563" alt="image" src="https://github.com/user-attachments/assets/5135a3fa-cf4f-4dd1-a032-205184bdca79" />
 
 If no cars match your input, the app will show available tags and suggest the closest match.
 
