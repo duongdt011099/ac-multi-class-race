@@ -623,6 +623,10 @@ local function LeaderboardProgress(carIndex)
   return (car.sessionLapCount or 0) + (car.splinePosition or 0)
 end
 
+local function IsFinite(v)
+  return type(v) == "number" and v == v and math.abs(v) ~= math.huge
+end
+
 local function GetPlayerPositions()
   local sim = ac.getSim()
   local trackLength = sim.trackLengthM
@@ -679,16 +683,23 @@ local function GetPlayerPositions()
     if car.idx == 0 then
       classPos = i
       if i > 1 then
-        gapFront = ac.getGapBetweenCars(0, classCars[i - 1].idx)
+        local g = ac.getGapBetweenCars(0, classCars[i - 1].idx)
+        if IsFinite(g) then gapFront = g end
       end
       if i < #classCars then
-        gapBehind = ac.getGapBetweenCars(0, classCars[i + 1].idx)
+        local g = ac.getGapBetweenCars(0, classCars[i + 1].idx)
+        if IsFinite(g) then gapBehind = g end
       end
       break
     end
   end
 
   if not sim.isSessionStarted then
+    gapFront = nil
+    gapBehind = nil
+  end
+
+  if playerCar and (playerCar.speedKmh or 0) < 2.0 then
     gapFront = nil
     gapBehind = nil
   end
