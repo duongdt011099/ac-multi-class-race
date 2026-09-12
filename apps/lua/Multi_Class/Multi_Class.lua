@@ -5,6 +5,7 @@ local firstFrame                  = true
 local leaderboardOpened           = false
 local lastSessionIndex            = nil
 local lastSessionStarted          = nil
+local playerStoppedState          = false
 
 local driverClass                 = {}
 local classOrder                  = {}
@@ -694,17 +695,25 @@ local function GetPlayerPositions()
     end
   end
 
+  local speed = playerCar and (playerCar.speedKmh or 0) or 0
+  if playerStoppedState then
+    if speed > 8.0 then playerStoppedState = false end
+  else
+    if speed < 2.0 then playerStoppedState = true end
+  end
+  local stopped = playerStoppedState
+
   if not sim.isSessionStarted then
     gapFront = nil
     gapBehind = nil
   end
 
-  if playerCar and (playerCar.speedKmh or 0) < 2.0 then
+  if stopped then
     gapFront = nil
     gapBehind = nil
   end
 
-  return overallPos, totalCars, classPos, classTotal, gapFront, gapBehind, currentLap, totalLaps
+  return overallPos, totalCars, classPos, classTotal, gapFront, gapBehind, currentLap, totalLaps, stopped
 end
 
 local hasDWrite = (type(ui.pushDWriteFont) == "function" and type(ui.dwriteText) == "function")
@@ -747,7 +756,7 @@ function script.clLeaderboard(dt)
   local w = ui.windowWidth()
   local h = ui.windowHeight()
 
-  local overallPos, totalCars, classPos, classTotal, gapFront, gapBehind, currentLap, totalLaps = GetPlayerPositions()
+  local overallPos, totalCars, classPos, classTotal, gapFront, gapBehind, currentLap, totalLaps, stopped = GetPlayerPositions()
 
   local padX = 12
   local gap = 16
@@ -755,13 +764,9 @@ function script.clLeaderboard(dt)
   local panelTop = 8
 
   local gapPanelH = 46
-  local hasGap = classTotal > 1 and sim.isSessionStarted
   local gapPanelTop = h - 8 - gapPanelH
 
-  local columnBottom = h - 8
-  if hasGap then
-    columnBottom = gapPanelTop - 10
-  end
+  local columnBottom = gapPanelTop - 10
   local panelH = columnBottom - panelTop
 
   local function DrawPanel(x, title, bigText, totalText, color)
@@ -801,28 +806,32 @@ function script.clLeaderboard(dt)
   DrawPanel(padX + panelW + gap, "OVERALL", sFormat("%d", overallPos), sFormat("%d", totalCars), rgbm(0.95, 0.95, 1, 1))
   DrawPanel(padX + 2 * (panelW + gap), "CLASS", sFormat("%d", classPos), sFormat("%d", classTotal), rgbm(0.35, 0.95, 0.45, 1))
 
-  if hasGap then
-    local gapStr = ""
-    if gapFront and gapBehind then
-      gapStr = sFormat("+%.1fs / -%.1fs", math.abs(gapFront), math.abs(gapBehind))
-    elseif gapFront then
-      gapStr = sFormat("+%.1fs", math.abs(gapFront))
-    elseif gapBehind then
-      gapStr = sFormat("-%.1fs", math.abs(gapBehind))
-    end
-
-    if gapStr ~= "" then
-      local gapPanelRight = w - padX
-      ui.drawRectFilled(vec2(padX, gapPanelTop), vec2(gapPanelRight, h - 8), rgbm(0.08, 0.10, 0.15, 0.6), 8)
-      ui.drawRect(vec2(padX, gapPanelTop), vec2(gapPanelRight, h - 8), rgbm(0.3, 0.3, 0.36, 0.7), 8, nil, 1.5)
-
-      local gFs = 20
-      local gSize = MeasureBoldText(gapStr, gFs)
-      if gSize.x > (w - 2 * padX - 24) then
-        gFs = math.max(12, math.floor(gFs * (w - 2 * padX - 24) / gSize.x))
+  if classTotal > 1 then
+    local gapStr = "--"
+    local gapColor = rgbm(0.55, 0.55, 0.6, 0.9)
+    if sim.isSessionStarted then
+      if stopped then
+        gapStr = "Car Stopped"
+        gapColor = rgbm(1.0, 0.7, 0.35, 1)
+      elseif gapFront and gapBehind then
+        gapStr = sFormat("+%.1fs / -%.1fs", math.abs(gapFront), math.abs(gapBehind))
+      elseif gapFront then
+        gapStr = sFormat("+%.1fs", math.abs(gapFront))
+      elseif gapBehind then
+        gapStr = sFormat("-%.1fs", math.abs(gapBehind))
       end
-      DrawBoldText(gapStr, w / 2, gapPanelTop + gapPanelH / 2, gFs, rgbm(0.7, 0.8, 0.9, 1))
     end
+
+    local gapPanelRight = w - padX
+    ui.drawRectFilled(vec2(padX, gapPanelTop), vec2(gapPanelRight, h - 8), rgbm(0.08, 0.10, 0.15, 0.6), 8)
+    ui.drawRect(vec2(padX, gapPanelTop), vec2(gapPanelRight, h - 8), rgbm(0.3, 0.3, 0.36, 0.7), 8, nil, 1.5)
+
+    local gFs = 20
+    local gSize = MeasureBoldText(gapStr, gFs)
+    if gSize.x > (w - 2 * padX - 24) then
+      gFs = math.max(12, math.floor(gFs * (w - 2 * padX - 24) / gSize.x))
+    end
+    DrawBoldText(gapStr, w / 2, gapPanelTop + gapPanelH / 2, gFs, gapColor)
   end
 end
 
@@ -852,6 +861,7 @@ function script.update(dt)
     Log(sFormat("FIRSTFRAME: idx=%s race=%s dc=%d rc=%d", tostring(sim.currentSessionIndex), tostring(IsRaceMode()), driverCount, #releaseClasses))
     leaderboardOpened = false
     raceHasStarted   = false
+    playerStoppedState = false
     allDriversStartingPos = {}
     if driverCount > 0 then
       LoadManualClassesFromStorage()
@@ -1033,6 +1043,7 @@ end
 ac.onSessionStart(function()
   firstFrame          = true
   raceHasStarted      = false
+  playerStoppedState  = false
   carClassCache       = {}
   allDriversStartingPos = {}
   uiSourceCache       = {}
