@@ -16,9 +16,15 @@ local classAddError               = nil
 local carClassCache               = {}
 local uiSourceCache               = {}
 
-local storedSettings              = ac.storage({ enduranceEnabled = true })
+local storedSettings              = ac.storage({ enduranceEnabled = true, qualiSaveEnabled = false, qualiSaveFolder = "" })
 
 local enduranceEnabled           = true
+
+local qualiSaveEnabled           = false
+local qualiSaveFolder            = ""
+local qualiPollTimer             = nil
+local qualiTargetPath            = nil
+local qualiSaveStatus            = ""
 
 local mMin = math.min
 local sFormat = string.format
@@ -483,6 +489,12 @@ local function LoadManualClassesFromStorage()
   if storedSettings.enduranceEnabled ~= nil then
     enduranceEnabled = storedSettings.enduranceEnabled
   end
+  if storedSettings.qualiSaveEnabled ~= nil then
+    qualiSaveEnabled = storedSettings.qualiSaveEnabled
+  end
+  if storedSettings.qualiSaveFolder ~= nil then
+    qualiSaveFolder = storedSettings.qualiSaveFolder or ""
+  end
   BuildClassInfo()
 end
 
@@ -499,6 +511,155 @@ end
 
 local function IsEnduranceMode()
   return enduranceEnabled and IsRaceMode()
+end
+
+local function IsQualiPracticeMode()
+  local sn = GetSessionNameLower()
+  return sn:find("qualifying") ~= nil or sn:find("practice") ~= nil
+end
+
+local function FormatLapMs(ms)
+  if type(ms) ~= "number" or ms <= 0 then return "--:--.---" end
+  local minutes = math.floor(ms / 60000)
+  local rest = ms % 60000
+  local seconds = math.floor(rest / 1000)
+  local milli = rest % 1000
+  return sFormat("%02d:%02d.%03d", minutes, seconds, milli)
+end
+
+local function JsonEscape(s)
+  s = tostring(s or "")
+  return s:gsub("\\", "\\\\"):gsub('"', '\\"')
+end
+
+local function QualiDefaultFolder()
+  if type(ac.dirname) == "function" then
+    local ok, d = pcall(function() return ac.dirname() end)
+    if ok and type(d) == "string" and d ~= "" then
+      return d
+    end
+  end
+  return ""
+end
+
+local function QualiEffectiveFolder()
+  if qualiSaveFolder and qualiSaveFolder ~= "" then
+    return qualiSaveFolder
+  end
+  return QualiDefaultFolder()
+end
+
+local function BuildQualiResultJson()
+  local entries = {}
+  for i = 0, driverCount - 1 do
+    local okCar, car = pcall(getCar, i)
+    local bt = nil
+    if okCar and car then
+      local okBt, v = pcall(function() return car.bestLapTimeMs end)
+      if okBt and type(v) == "number" and v > 0 then
+        bt = v
+      end
+    end
+    if bt then
+      local driver = ""
+      local okD, d = pcall(function() return ac.getDriverName and ac.getDriverName(i) end)
+      if okD and type(d) == "string" then driver = d end
+      local carID = ""
+      local okC, c = pcall(function() return ac.getCarID and ac.getCarID(i) end)
+      if okC and type(c) == "string" then carID = c end
+      local skin = ""
+      local okS, s = pcall(function() return ac.getCarSkinID and ac.getCarSkinID(i) end)
+      if okS and type(s) == "string" then skin = s end
+      entries[#entries + 1] = {
+        driver = JsonEscape(driver),
+        car = JsonEscape(carID),
+        skin = JsonEscape(skin),
+        best = FormatLapMs(bt)
+      }
+    end
+  end
+
+  local out = { "[" }
+  for k, e in ipairs(entries) do
+    out[#out + 1] = "    {"
+    out[#out + 1] = sFormat('        "driver": "%s",', e.driver)
+    out[#out + 1] = sFormat('        "car": "%s",', e.car)
+    out[#out + 1] = sFormat('        "skin": "%s",', e.skin)
+    out[#out + 1] = sFormat('        "bestLapTimeMs": "%s"', e.best)
+    out[#out + 1] = (k < #entries) and "    }," or "    }"
+  end
+  out[#out + 1] = "]"
+  return table.concat(out, "\n")
+end
+
+local function SaveQualiResult(showToast)
+  if not qualiTargetPath or qualiTargetPath == "" then return end
+  local ok, err = pcall(function()
+    local okSaved = io.save(qualiTargetPath, BuildQualiResultJson())
+    if not okSaved then
+      error("io.save returned false")
+    end
+    return true
+  end)
+  if ok then
+    local stamp = type(os.date) == "function" and os.date("%H:%M:%S") or ""
+    qualiSaveStatus = "Last saved " .. stamp .. " -> " .. qualiTargetPath
+    if showToast then
+      ui.toast(ui.Icons.Play, "Quali result saved")
+    end
+  else
+    local msg = "Failed to save quali result: " .. tostring(err)
+    if qualiSaveStatus ~= msg then
+      qualiSaveStatus = msg
+      ui.toast(ui.Icons.Warning, msg)
+    end
+  end
+end
+
+local function StopQualiPolling()
+  if qualiPollTimer then
+    pcall(function()
+      if type(clearInterval) == "function" then clearInterval(qualiPollTimer) end
+    end)
+    qualiPollTimer = nil
+  end
+end
+
+local function StartQualiPolling()
+  StopQualiPolling()
+  local folder = QualiEffectiveFolder()
+  if folder == "" then
+    qualiTargetPath = ""
+    return
+  end
+  pcall(function()
+    if type(io.createDir) == "function" then io.createDir(folder) end
+  end)
+  local stamp = type(os.date) == "function" and os.date("%Y%m%d_%H%M%S") or "session"
+  qualiTargetPath = folder .. "/qualifying-result_" .. stamp .. ".json"
+  if type(setInterval) ~= "function" then
+    SaveQualiResult(false)
+    return
+  end
+  local okI, id = pcall(function()
+    return setInterval(function()
+      pcall(SaveQualiResult, false)
+    end, 1.0, "multi_class_quali_result_save")
+  end)
+  if okI and id then
+    qualiPollTimer = id
+    SaveQualiResult(true)
+  else
+    SaveQualiResult(false)
+  end
+end
+
+local function RestartQualiPolling()
+  if qualiSaveEnabled and IsQualiPracticeMode() then
+    StartQualiPolling()
+  else
+    StopQualiPolling()
+  end
 end
 
 local function CheckSessionValidity()
@@ -853,6 +1014,7 @@ function script.update(dt)
     firstFrame = true
     carClassCache = {}
     uiSourceCache = {}
+    StopQualiPolling()
   end
   lastSessionIndex = sim.currentSessionIndex
   lastSessionStarted = sim.isSessionStarted
@@ -888,6 +1050,13 @@ function script.update(dt)
 
   if sim.isInMainMenu == true then
     ac.setWindowOpen("cl_config", true)
+  end
+
+  local shouldPoll = qualiSaveEnabled and IsQualiPracticeMode() and sim.isInMainMenu ~= true
+  if shouldPoll and not qualiPollTimer then
+    StartQualiPolling()
+  elseif not shouldPoll and qualiPollTimer then
+    StopQualiPolling()
   end
 
   local valid, _ = CheckSessionValidity()
@@ -926,19 +1095,81 @@ function script.clConfig()
   ui.drawRectFilled(vec2(0, 0), vec2(w, h), rgbm(0.04, 0.05, 0.07, 0.85), 0)
   ui.drawRect(vec2(0, 0), vec2(w, h), rgbm(0.18, 0.18, 0.20, 0.6), 0, nil, 1)
 
-  if valid then
-    ui.pushFont(ui.Font.Title)
-    local titleText = "Multiple Class Race Configuration"
-    local titleSize = ui.measureText(titleText)
-    local titleX = (w - titleSize.x) / 2
-    ui.setCursor(vec2(titleX, 12))
-    ui.text(titleText)
+  ui.pushFont(ui.Font.Title)
+  local titleText = "Multiple Class Race Configuration"
+  local titleSize = ui.measureText(titleText)
+  local titleX = (w - titleSize.x) / 2
+  ui.setCursor(vec2(titleX, 12))
+  ui.text(titleText)
+  ui.popFont()
+
+  local separatorY = ui.getCursor().y + 10
+  ui.drawLine(vec2(colX, separatorY), vec2(w - 24, separatorY), rgbm(0.25, 0.25, 0.28, 0.5), 1)
+  ui.setCursor(vec2(colX, separatorY + 12))
+
+  if not IsRaceMode() then
+    if ui.checkbox("Auto-save Qualifying/Practice best-lap results (every second)", qualiSaveEnabled) then
+      qualiSaveEnabled = not qualiSaveEnabled
+      storedSettings.qualiSaveEnabled = qualiSaveEnabled
+      RestartQualiPolling()
+    end
+
+    ui.setCursor(vec2(colX, ui.getCursor().y + 4))
+    if ui.button("Choose save folder...", vec2(w - 48, 28)) then
+      local dlgOk, dlgErr = pcall(function()
+        if type(os.openFileDialog) ~= "function" then
+          ui.toast(ui.Icons.Warning, "Folder dialog is not available on this CSP version.")
+        else
+          local defaultFolder = ac.getFolder and ac.getFolder(ac.FolderID.Documents) or ""
+          os.openFileDialog({
+            title = "Choose save folder for qualifying/practice results",
+            defaultFolder = defaultFolder,
+            folder = (qualiSaveFolder ~= "") and qualiSaveFolder or nil,
+            flags = os.DialogFlags and bit.bor(os.DialogFlags.PickFolders, os.DialogFlags.PathMustExist) or nil
+          }, function(err, path)
+            if (not err or err == "") and path and path ~= "" then
+              qualiSaveFolder = path
+              storedSettings.qualiSaveFolder = path
+              RestartQualiPolling()
+              ui.toast(ui.Icons.Play, "Quali result save folder set")
+            elseif err and err ~= "" then
+              ui.toast(ui.Icons.Warning, "Error choosing folder: " .. err)
+            end
+          end)
+        end
+      end)
+      if not dlgOk then
+        ui.toast(ui.Icons.Warning, "Error opening folder dialog: " .. tostring(dlgErr))
+      end
+    end
+
+    ui.setCursor(vec2(colX, ui.getCursor().y + 6))
+    ui.pushFont(ui.Font.Small)
+    if qualiSaveFolder ~= "" then
+      ui.textWrapped("Save folder: " .. qualiSaveFolder)
+      ui.setCursor(vec2(colX, ui.getCursor().y + 2))
+      if ui.button("Reset to Default (app folder)", vec2(230, 22)) then
+        qualiSaveFolder = ""
+        storedSettings.qualiSaveFolder = ""
+        RestartQualiPolling()
+      end
+    else
+      ui.textColored("Save folder: Default (app folder)", rgbm(0.6, 0.6, 0.7, 1))
+      if ui.itemHovered() then
+        ui.setTooltip(QualiDefaultFolder())
+      end
+    end
+    ui.setCursor(vec2(colX, ui.getCursor().y + 2))
+    if qualiSaveStatus ~= "" then
+      ui.textWrapped(qualiSaveStatus)
+    else
+      ui.textColored("No session data saved yet.", rgbm(0.6, 0.6, 0.7, 1))
+    end
     ui.popFont()
+    ui.dummy(vec2(0, 8))
+  end
 
-    local separatorY = ui.getCursor().y + 10
-    ui.drawLine(vec2(colX, separatorY), vec2(w - 24, separatorY), rgbm(0.25, 0.25, 0.28, 0.5), 1)
-    ui.setCursor(vec2(colX, separatorY + 12))
-
+  if valid then
     if ui.checkbox("Enable Multiple Class Race", enduranceEnabled) then
       enduranceEnabled = not enduranceEnabled
       storedSettings.enduranceEnabled = enduranceEnabled
@@ -1019,18 +1250,7 @@ function script.clConfig()
     end
 
   else
-    ui.pushFont(ui.Font.Title)
-    local errTitle = "Multiple Class Race Disabled"
-    local errTitleSize = ui.measureText(errTitle)
-    local errTitleX = (w - errTitleSize.x) / 2
-    ui.setCursor(vec2(errTitleX, 12))
-    ui.text(errTitle)
-    ui.popFont()
-
-    local separatorY = ui.getCursor().y + 10
-    ui.drawLine(vec2(24, separatorY), vec2(w - 24, separatorY), rgbm(0.25, 0.25, 0.28, 0.5), 1)
-    ui.setCursor(vec2(24, separatorY + 16))
-
+    ui.setCursor(vec2(colX, ui.getCursor().y))
     ui.pushItemWidth(w - 48)
     ui.textWrapped(err or "Class-based mode cannot be enabled under current conditions!")
     ui.popItemWidth()
@@ -1047,6 +1267,7 @@ ac.onSessionStart(function()
   carClassCache       = {}
   allDriversStartingPos = {}
   uiSourceCache       = {}
+  StopQualiPolling()
   Log("onSessionStart: firstFrame=true")
 end)
 
