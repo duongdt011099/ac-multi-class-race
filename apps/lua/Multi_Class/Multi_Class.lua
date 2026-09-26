@@ -896,6 +896,25 @@ local function GetPlayerPositions()
     gapBehind = nil
   end
 
+  local enginePos = nil
+  local okEp, ep = pcall(function() return getCar(0).racePosition end)
+  if okEp and type(ep) == "number" and ep > 0 then
+    enginePos = ep
+  end
+
+  if enginePos then
+    overallPos = enginePos
+    classPos = 1
+    for _, car in ipairs(classCars) do
+      if car.idx ~= 0 then
+        local okR, rp = pcall(function() return getCar(car.idx).racePosition end)
+        if okR and type(rp) == "number" and rp > 0 and rp < enginePos then
+          classPos = classPos + 1
+        end
+      end
+    end
+  end
+
   return overallPos, totalCars, classPos, classTotal, gapFront, gapBehind, currentLap, totalLaps, stopped
 end
 
