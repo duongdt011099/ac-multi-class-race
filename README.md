@@ -123,6 +123,6 @@ If no cars match your input, the app will show available tags and suggest the cl
 
 ## Credits
 
-- **Author:** Anonymous
+- **Author:** Duong Do
 - **Version:** 1.0
 - Built with the Assetto Corsa CSP Lua API
