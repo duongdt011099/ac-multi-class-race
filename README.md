@@ -11,6 +11,7 @@ A CSP Lua app for Assetto Corsa that provides class-based position tracking and 
 - **Time gap display** — See the time gap to the nearest class car ahead (+) and behind (-)
 - **Manual class assignment** — You define class names; cars matching that tag/class are assigned
 - **Persistent settings** — Class assignments are saved and persist across sessions
+- **Qualifying/Practice auto-save** — Automatically export every car's best lap time to a JSON file each second during qualifying and practice sessions
 
 ## Requirements
 
@@ -52,6 +53,42 @@ The leaderboard overlay shows during your session:
 | **Gap** | Time gap to class car ahead (+) and behind (-) |
 
 <img width="317" height="183" alt="image" src="https://github.com/user-attachments/assets/95ea3d53-74e8-49f1-98a4-f809e8fd29a1" />
+
+### Qualifying / Practice Auto-Save
+
+While driving in **Qualifying** or **Practice** sessions, the app can automatically export the best lap times of every car on track to a JSON file.
+
+**Enable it:** in the Config window, tick **"Auto-save Qualifying/Practice best-lap results (every second)"**. This option is only shown outside race sessions (qualifying, practice, and the main menu).
+
+**Choose where to save:** click **"Choose save folder..."** to pick a destination folder. By default, results are written into the app's own folder (`apps\lua\Multi_Class\`). Use **"Reset to Default (app folder)"** to go back to the default. The status line below the controls shows where the results were last saved.
+
+**What happens:** while enabled, the app writes a fresh snapshot once every second during the session. A new file is created for each session, named with a timestamp:
+
+```
+qualifying-result_YYYYMMDD_HHMMSS.json
+```
+
+The file is a JSON array with one entry per car that has set a lap time:
+
+```json
+[
+    {
+        "driver": "Driver Name",
+        "car": "car_id",
+        "skin": "skin_id",
+        "bestLapTimeMs": "01:30.123"
+    }
+]
+```
+
+| Field | Description |
+|-------|-------------|
+| `driver` | Driver name |
+| `car` | Car ID |
+| `skin` | Car skin ID |
+| `bestLapTimeMs` | Best lap time, formatted `MM:SS.mmm` |
+
+Auto-save only runs in Qualifying/Practice sessions — it never writes results during a race.
 
 ## How Classes Work
 
