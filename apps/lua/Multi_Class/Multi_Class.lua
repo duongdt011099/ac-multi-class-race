@@ -493,7 +493,7 @@ local function LoadManualClassesFromStorage()
     qualiSaveEnabled = storedSettings.qualiSaveEnabled
   end
   if storedSettings.qualiSaveFolder ~= nil then
-    qualiSaveFolder = storedSettings.qualiSaveFolder or ""
+    qualiSaveFolder = NormalizePath(storedSettings.qualiSaveFolder or "")
   end
   BuildClassInfo()
 end
@@ -532,11 +532,16 @@ local function JsonEscape(s)
   return s:gsub("\\", "\\\\"):gsub('"', '\\"')
 end
 
+local function NormalizePath(p)
+  if type(p) ~= "string" or p == "" then return p or "" end
+  return p:gsub("\\", "/")
+end
+
 local function QualiDefaultFolder()
   if type(ac.dirname) == "function" then
     local ok, d = pcall(function() return ac.dirname() end)
     if ok and type(d) == "string" and d ~= "" then
-      return d
+      return NormalizePath(d)
     end
   end
   return ""
@@ -789,9 +794,17 @@ local function IsFinite(v)
   return type(v) == "number" and v == v and math.abs(v) ~= math.huge
 end
 
-local function GetPlayerPositions()
+local function GetCarBestLapMs(idx)
+  local ok, car = pcall(getCar, idx)
+  if ok and car then
+    local okBt, bt = pcall(function() return car.bestLapTimeMs end)
+    if okBt and type(bt) == "number" and bt > 0 then return bt end
+  end
+  return nil
+end
+
+local function GetCurrentLapInfo()
   local sim = ac.getSim()
-  local trackLength = sim.trackLengthM
   local playerCar = getCar(0)
 
   local totalLaps = 0
@@ -804,6 +817,23 @@ local function GetPlayerPositions()
     lapRaw = playerCar.lapCount + 1
   end
   local currentLap = totalLaps > 0 and math.min(totalLaps, lapRaw) or lapRaw
+
+  local speed = playerCar and (playerCar.speedKmh or 0) or 0
+  if playerStoppedState then
+    if speed > 8.0 then playerStoppedState = false end
+  else
+    if speed < 2.0 then playerStoppedState = true end
+  end
+
+  return currentLap, totalLaps, playerStoppedState
+end
+
+local function GetPlayerPositions()
+  local sim = ac.getSim()
+  local trackLength = sim.trackLengthM
+  local playerCar = getCar(0)
+
+  local currentLap, totalLaps, stopped = GetCurrentLapInfo()
 
   local overallPos = 1
   local classPos = 1
@@ -856,14 +886,6 @@ local function GetPlayerPositions()
     end
   end
 
-  local speed = playerCar and (playerCar.speedKmh or 0) or 0
-  if playerStoppedState then
-    if speed > 8.0 then playerStoppedState = false end
-  else
-    if speed < 2.0 then playerStoppedState = true end
-  end
-  local stopped = playerStoppedState
-
   if not sim.isSessionStarted then
     gapFront = nil
     gapBehind = nil
@@ -875,6 +897,64 @@ local function GetPlayerPositions()
   end
 
   return overallPos, totalCars, classPos, classTotal, gapFront, gapBehind, currentLap, totalLaps, stopped
+end
+
+local function GetPlayerPositionsQuali()
+  local playerClass = driverClass[0]
+
+  local allCars = {}
+  local classCars = {}
+  local totalCars = 0
+  local classTotal = 0
+
+  for i = 0, driverCount - 1 do
+    local car = getCar(i)
+    if car then
+      local best = GetCarBestLapMs(i)
+      totalCars = totalCars + 1
+      allCars[#allCars + 1] = { idx = i, best = best }
+      if driverClass[i] == playerClass then
+        classTotal = classTotal + 1
+        classCars[#classCars + 1] = { idx = i, best = best }
+      end
+    end
+  end
+
+  local function bestSorter(a, b)
+    if a.best and b.best then return a.best < b.best end
+    if a.best then return true end
+    if b.best then return false end
+    return a.idx < b.idx
+  end
+  table.sort(allCars, bestSorter)
+  table.sort(classCars, bestSorter)
+
+  local overallPos = 1
+  for i, c in ipairs(allCars) do
+    if c.idx == 0 then
+      overallPos = i
+      break
+    end
+  end
+  local classPos = 1
+  for i, c in ipairs(classCars) do
+    if c.idx == 0 then
+      classPos = i
+      break
+    end
+  end
+
+  local classFastestMs = nil
+  for _, c in ipairs(classCars) do
+    if c.best then
+      classFastestMs = c.best
+      break
+    end
+  end
+
+  local playerBestMs = GetCarBestLapMs(0)
+
+  return overallPos, totalCars, classPos, classTotal, classFastestMs, playerBestMs
 end
 
 local hasDWrite = (type(ui.pushDWriteFont) == "function" and type(ui.dwriteText) == "function")
@@ -917,7 +997,16 @@ function script.clLeaderboard(dt)
   local w = ui.windowWidth()
   local h = ui.windowHeight()
 
-  local overallPos, totalCars, classPos, classTotal, gapFront, gapBehind, currentLap, totalLaps, stopped = GetPlayerPositions()
+  local qualiMode = IsQualiPracticeMode()
+  local overallPos, totalCars, classPos, classTotal, gapFront, gapBehind, currentLap, totalLaps, stopped
+  local classFastestMs, playerBestMs = nil, nil
+  if qualiMode then
+    overallPos, totalCars, classPos, classTotal, classFastestMs, playerBestMs = GetPlayerPositionsQuali()
+    currentLap, totalLaps, stopped = GetCurrentLapInfo()
+    gapFront, gapBehind = nil, nil
+  else
+    overallPos, totalCars, classPos, classTotal, gapFront, gapBehind, currentLap, totalLaps, stopped = GetPlayerPositions()
+  end
 
   local padX = 12
   local gap = 16
@@ -967,7 +1056,27 @@ function script.clLeaderboard(dt)
   DrawPanel(padX + panelW + gap, "OVERALL", sFormat("%d", overallPos), sFormat("%d", totalCars), rgbm(0.95, 0.95, 1, 1))
   DrawPanel(padX + 2 * (panelW + gap), "CLASS", sFormat("%d", classPos), sFormat("%d", classTotal), rgbm(0.35, 0.95, 0.45, 1))
 
-  if classTotal > 1 then
+  if qualiMode then
+    local posY = gapPanelTop + gapPanelH / 2
+    local gapPanelRight = w - padX
+    ui.drawRectFilled(vec2(padX, gapPanelTop), vec2(gapPanelRight, h - 8), rgbm(0.08, 0.10, 0.15, 0.6), 8)
+    ui.drawRect(vec2(padX, gapPanelTop), vec2(gapPanelRight, h - 8), rgbm(0.3, 0.3, 0.36, 0.7), 8, nil, 1.5)
+
+    local fastLap = classFastestMs and FormatLapMs(classFastestMs) or "--:--.---"
+    local myLap = playerBestMs and FormatLapMs(playerBestMs) or "--:--.---"
+
+    local maxW = w - 2 * padX - 24
+    local gFs = 15
+    local fastRow = "FASTEST  " .. fastLap
+    local myRow = "YOU      " .. myLap
+    local need = math.max(MeasureBoldText(fastRow, gFs).x, MeasureBoldText(myRow, gFs).x)
+    if need > maxW then
+      gFs = math.max(12, math.floor(gFs * maxW / need))
+    end
+
+    DrawBoldText(fastRow, w / 2, posY - (math.floor(gFs / 2) + 1), gFs, rgbm(0.35, 0.95, 0.45, 1))
+    DrawBoldText(myRow, w / 2, posY + (math.floor(gFs / 2) + 1), gFs, rgbm(0.95, 0.95, 1, 1))
+  elseif classTotal > 1 then
     local gapStr = "--"
     local gapColor = rgbm(0.55, 0.55, 0.6, 0.9)
     if sim.isSessionStarted then
@@ -1128,8 +1237,8 @@ function script.clConfig()
             flags = os.DialogFlags and bit.bor(os.DialogFlags.PickFolders, os.DialogFlags.PathMustExist) or nil
           }, function(err, path)
             if (not err or err == "") and path and path ~= "" then
-              qualiSaveFolder = path
-              storedSettings.qualiSaveFolder = path
+              qualiSaveFolder = NormalizePath(path)
+              storedSettings.qualiSaveFolder = qualiSaveFolder
               RestartQualiPolling()
               ui.toast(ui.Icons.Play, "Quali result save folder set")
             elseif err and err ~= "" then
