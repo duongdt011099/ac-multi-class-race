@@ -121,6 +121,14 @@ If no cars match your input, the app will show available tags and suggest the cl
 | "Waiting for car data to load..." | Wait for the session to fully initialize |
 | No class assignments found | Add classes in the Config window first |
 
+## License
+
+This project is licensed under the **MIT License** with additional terms. See the [`LICENSE`](LICENSE) file for the full text.
+
+- You may **read, study, and contribute** to the source code.
+- The **author credit** ("Duong Do") must not be removed or changed in any copy or derivative work.
+- Redistributing or publishing the **complete source code** as a standalone repository or release is **not permitted**.
+
 ## Credits
 
 - **Author:** Duong Do
