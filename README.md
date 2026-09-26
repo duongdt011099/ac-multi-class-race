@@ -21,6 +21,7 @@ A CSP Lua app for Assetto Corsa that provides class-based position tracking and 
 
 ## Installation
 
+You can drag & drop the rar file into Content Manager or do it manually by extracting it:
 1. Copy the `apps\lua\Multi_Class\` folder into your Assetto Corsa installation:
    ```
    <Assetto Corsa>\apps\lua\Multi_Class\
