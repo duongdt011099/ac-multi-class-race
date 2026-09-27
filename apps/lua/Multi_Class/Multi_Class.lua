@@ -9,8 +9,11 @@ local playerStoppedState          = false
 local raceDisplayStable           = nil
 local raceDisplayPending          = nil
 local RACE_POS_STABLE_FRAMES      = 2
+local gridReordered               = false
+local classReloadAttempted        = false
 
 local driverClass                 = {}
+local displayClass                = {}
 local classOrder                  = {}
 local releaseClasses              = {}
 local manualDriverClass           = {}
@@ -36,7 +39,7 @@ local setAITopSpeed = physics.setAITopSpeed
 local setAICaution = physics.setAICaution
 local setAIThrottleLimit = physics.setAIThrottleLimit
 
-local DEBUG_ENABLED = false
+local DEBUG_ENABLED = true
 local debugLogFile = nil
 local function Log(msg)
   if not DEBUG_ENABLED then return end
@@ -57,21 +60,45 @@ local function Log(msg)
   end)
 end
 
-local function SaveCarClass(carID, cls)
-  if not carID then return end
-  pcall(function()
-    ac.storage["carclass_" .. carID] = cls or ""
-  end)
+-- Storage key resolution. Primary key is the car's AC ID; when that is unavailable we
+-- fall back to the grid index so a class added in one session is not silently lost.
+local function carClassKey(carID, carIndex)
+  if carID and carID ~= "" then
+    return "carclass_" .. tostring(carID)
+  end
+  if carIndex ~= nil then
+    return "carclass_idx_" .. tostring(carIndex)
+  end
+  return nil
 end
 
-local function LoadCarClass(carID)
-  if not carID then return nil end
+local function SaveCarClass(carID, cls, carIndex)
+  local key = carClassKey(carID, carIndex)
+  if not key then
+    Log("SaveCarClass ABORT: no carID and no carIndex - value NOT persisted")
+    return false
+  end
+  local ok = pcall(function()
+    ac.storage[key] = cls or ""
+  end)
+  Log(sFormat("SaveCarClass: key=%s cls='%s' idx=%s ok=%s", key, tostring(cls), tostring(carIndex), tostring(ok)))
+  return ok
+end
+
+local function LoadCarClass(carID, carIndex)
+  local key = carClassKey(carID, carIndex)
+  if not key then
+    Log("LoadCarClass ABORT: no carID and no carIndex")
+    return nil
+  end
   local ok, v = pcall(function()
-    return ac.storage["carclass_" .. carID]
+    return ac.storage[key]
   end)
   if ok and v and v ~= "" then
+    Log(sFormat("LoadCarClass: key=%s -> '%s' idx=%s", key, tostring(v), tostring(carIndex)))
     return v
   end
+  Log(sFormat("LoadCarClass: key=%s -> (empty) idx=%s", key, tostring(carIndex)))
   return nil
 end
 
@@ -306,7 +333,12 @@ local function AddReleaseClass(name)
     if not ok then m = false end
     if m then
       manualDriverClass[i] = n
-      SaveCarClass(ac.getCarID and ac.getCarID(i), n)
+      local okSave, carID = pcall(function() return ac.getCarID and ac.getCarID(i) end)
+      if not okSave then carID = nil end
+      local saved = SaveCarClass(carID, n, i)
+      if not saved then
+        Log(sFormat("AddReleaseClass WARN: car %d class '%s' assigned in memory but NOT persisted", i, n))
+      end
       matched = matched + 1
     end
   end
@@ -336,6 +368,7 @@ local function AddReleaseClass(name)
   classAddInput = ""
   SaveClassNames()
   BuildClassInfo()
+  Log(sFormat("AddReleaseClass DONE: '%s' matched=%d releaseClasses={%s}", n, matched, table.concat(releaseClasses, ",")))
   VerifyClassAssignments()
 end
 
@@ -371,7 +404,9 @@ RemoveReleaseClass = function(idx)
   for i = 0, driverCount - 1 do
     if manualDriverClass[i] == n then
       manualDriverClass[i] = ""
-      SaveCarClass(ac.getCarID and ac.getCarID(i), "")
+      local okID, carID = pcall(function() return ac.getCarID and ac.getCarID(i) end)
+      if not okID then carID = nil end
+      SaveCarClass(carID, "", i)
     end
   end
   classAddError = nil
@@ -382,6 +417,7 @@ end
 BuildClassInfo = function()
   Log(sFormat("BuildClassInfo: dc=%d entries=%d", driverCount, #manualDriverClass))
   driverClass = {}
+  displayClass = {}
   classOrder = {}
 
   if driverCount == 0 then return end
@@ -396,6 +432,19 @@ BuildClassInfo = function()
     end
 
     driverClass[i] = key
+
+    -- Display-only fallback: used exclusively by the leaderboard CLASS panel so that
+    -- unassigned cars still get a sensible class position. This map must never feed
+    -- VerifyClassAssignments or ReorderGridByClass, otherwise unadded classes would
+    -- be reported as added ones.
+    local dkey = key
+    if not dkey then
+      local detected = GetCarClassCached(i)
+      if detected and detected ~= "" then
+        dkey = "class" .. string.lower(detected)
+      end
+    end
+    displayClass[i] = dkey
 
     if key then
       local pos = allDriversStartingPos[i] or (i + 1)
@@ -441,6 +490,14 @@ BuildClassInfo = function()
 
 end
 
+-- Defined before LoadManualClassesFromStorage uses it. Previously this lived further
+-- down the file, so the call resolved to a nil global and threw every frame, which
+-- aborted the rest of session setup (including BuildClassInfo).
+local function NormalizePath(p)
+  if type(p) ~= "string" or p == "" then return p or "" end
+  return p:gsub("\\", "/")
+end
+
 local function LoadManualClassesFromStorage()
   Log(sFormat("LoadManualClassesFromStorage: START driverCount=%d", driverCount))
   releaseClasses = {}
@@ -448,20 +505,17 @@ local function LoadManualClassesFromStorage()
   local anyLoaded = false
   for i = 0, driverCount - 1 do
     local okID, carID = pcall(function() return ac.getCarID and ac.getCarID(i) end)
-    if okID and carID then
-      local cls = LoadCarClass(carID)
-      if type(cls) == "string" and cls ~= "" then
-        manualDriverClass[i] = cls
-        anyLoaded = true
-        if not seen[cls] then
-          seen[cls] = true
-          releaseClasses[#releaseClasses + 1] = cls
-        end
-      else
-        manualDriverClass[i] = ""
+    if not okID then carID = nil end
+    local cls = LoadCarClass(carID, i)
+    if type(cls) == "string" and cls ~= "" then
+      manualDriverClass[i] = cls
+      anyLoaded = true
+      if not seen[cls] then
+        seen[cls] = true
+        releaseClasses[#releaseClasses + 1] = cls
       end
     else
-      Log(sFormat("LoadManualClassesFromStorage: car %d ac.getCarID failed okID=%s carID=%s", i, tostring(okID), tostring(carID)))
+      manualDriverClass[i] = ""
     end
   end
   Log(sFormat("LoadManualClassesFromStorage: DONE anyLoaded=%s releaseClasses=%d classes={%s}", tostring(anyLoaded), #releaseClasses, table.concat(releaseClasses, ",")))
@@ -478,7 +532,9 @@ local function LoadManualClassesFromStorage()
           if not ok then m = false end
           if m then
             manualDriverClass[i] = name
-            SaveCarClass(ac.getCarID and ac.getCarID(i), name)
+            local okID2, carID2 = pcall(function() return ac.getCarID and ac.getCarID(i) end)
+            if not okID2 then carID2 = nil end
+            SaveCarClass(carID2, name, i)
             matched = matched + 1
           end
         end
@@ -489,16 +545,26 @@ local function LoadManualClassesFromStorage()
       end
     end
   end
-  if storedSettings.enduranceEnabled ~= nil then
-    enduranceEnabled = storedSettings.enduranceEnabled
+  -- Restoring settings must never be able to abort class loading, so it is isolated.
+  local okSettings, settingsErr = pcall(function()
+    if storedSettings.enduranceEnabled ~= nil then
+      enduranceEnabled = storedSettings.enduranceEnabled
+    end
+    if storedSettings.qualiSaveEnabled ~= nil then
+      qualiSaveEnabled = storedSettings.qualiSaveEnabled
+    end
+    if storedSettings.qualiSaveFolder ~= nil then
+      qualiSaveFolder = NormalizePath(storedSettings.qualiSaveFolder or "")
+    end
+  end)
+  if not okSettings then
+    Log("LoadManualClassesFromStorage: settings restore FAILED err=" .. tostring(settingsErr))
   end
-  if storedSettings.qualiSaveEnabled ~= nil then
-    qualiSaveEnabled = storedSettings.qualiSaveEnabled
+
+  local okBuild, buildErr = pcall(BuildClassInfo)
+  if not okBuild then
+    Log("LoadManualClassesFromStorage: BuildClassInfo FAILED err=" .. tostring(buildErr))
   end
-  if storedSettings.qualiSaveFolder ~= nil then
-    qualiSaveFolder = NormalizePath(storedSettings.qualiSaveFolder or "")
-  end
-  BuildClassInfo()
 end
 
 local function GetSessionNameLower()
@@ -533,11 +599,6 @@ end
 local function JsonEscape(s)
   s = tostring(s or "")
   return s:gsub("\\", "\\\\"):gsub('"', '\\"')
-end
-
-local function NormalizePath(p)
-  if type(p) ~= "string" or p == "" then return p or "" end
-  return p:gsub("\\", "/")
 end
 
 local function QualiDefaultFolder()
@@ -903,7 +964,7 @@ local function GetPlayerPositions()
   local gapFront = nil
   local gapBehind = nil
 
-  local playerClass = driverClass[0]
+  local playerClass = displayClass[0]
 
   local allCars = {}
   local classCars = {}
@@ -917,15 +978,23 @@ local function GetPlayerPositions()
 
       -- playerClass can be nil when no class could be resolved; without this guard
       -- 'nil == nil' would match every car and inflate classTotal up to totalCars.
-      if playerClass and driverClass[i] == playerClass then
+      if playerClass and displayClass[i] == playerClass then
         classTotal = classTotal + 1
         classCars[#classCars + 1] = { idx = i, prog = prog }
       end
     end
   end
 
-  table.sort(allCars, function(a, b) return a.prog > b.prog end)
-  table.sort(classCars, function(a, b) return a.prog > b.prog end)
+  -- progSorter tolerates a missing prog (nil) so a sort can never abort clLeaderboard.
+  -- Mirrors bestSorter: cars with a value sort ahead of those without, ties broken by idx.
+  local function progSorter(a, b)
+    if a.prog and b.prog then return a.prog > b.prog end
+    if a.prog then return true end
+    if b.prog then return false end
+    return a.idx < b.idx
+  end
+  table.sort(allCars, progSorter)
+  table.sort(classCars, progSorter)
 
   for i, car in ipairs(allCars) do
     if car.idx == 0 then
@@ -1008,7 +1077,7 @@ local function GetPlayerPositions()
 end
 
 local function GetPlayerPositionsQuali()
-  local playerClass = driverClass[0]
+  local playerClass = displayClass[0]
 
   local allCars = {}
   local classCars = {}
@@ -1021,7 +1090,7 @@ local function GetPlayerPositionsQuali()
       local best = GetCarBestLapMs(i)
       totalCars = totalCars + 1
       allCars[#allCars + 1] = { idx = i, best = best }
-      if playerClass and driverClass[i] == playerClass then
+      if playerClass and displayClass[i] == playerClass then
         classTotal = classTotal + 1
         classCars[#classCars + 1] = { idx = i, best = best }
       end
@@ -1165,7 +1234,7 @@ function script.clLeaderboard(dt)
   if classTotal > 0 then
     DrawPanel(padX + 2 * (panelW + gap), "CLASS", sFormat("%d", classPos), sFormat("%d", classTotal), rgbm(0.35, 0.95, 0.45, 1))
   else
-    DrawPanel(padX + 2 * (panelW + gap), "CLASS", "-", "no class", rgbm(0.55, 0.55, 0.6, 1))
+    DrawPanel(padX + 2 * (panelW + gap), "CLASS", "-", "add a class", rgbm(0.55, 0.55, 0.6, 1))
   end
 
   if qualiMode then
@@ -1241,30 +1310,46 @@ function script.update(dt)
   lastSessionStarted = sim.isSessionStarted
 
   if firstFrame then
+    -- Cleared before the work runs: if anything below throws, the flag stays false so a
+    -- single failure cannot turn into a per-frame infinite loop.
+    firstFrame = false
     Log(sFormat("FIRSTFRAME: idx=%s race=%s dc=%d rc=%d", tostring(sim.currentSessionIndex), tostring(IsRaceMode()), driverCount, #releaseClasses))
     leaderboardOpened = false
     raceHasStarted   = false
     playerStoppedState = false
     allDriversStartingPos = {}
     if driverCount > 0 then
-      LoadManualClassesFromStorage()
+      for i = 0, driverCount - 1 do
+        local okID, carID = pcall(function() return ac.getCarID and ac.getCarID(i) end)
+        if not okID then carID = nil end
+        Log(sFormat("GRID: i=%d carID=%s name=%s", i, tostring(carID), tostring(ac.getCarName and ac.getCarName(i))))
+      end
+      local okLoad, loadErr = pcall(LoadManualClassesFromStorage)
+      if not okLoad then
+        Log("FIRSTFRAME: LoadManualClassesFromStorage FAILED err=" .. tostring(loadErr))
+      end
       if IsEnduranceMode() then
         RecordStartingPositions()
         ReorderGridByClass()
+        gridReordered = true
         ReleaseAllCars()
       end
     end
-    firstFrame = false
     Log(sFormat("FIRSTFRAME DONE: rc=%d classes={%s}", #releaseClasses, table.concat(releaseClasses, ",")))
   end
 
-  if #releaseClasses == 0 and driverCount > 0 then
+  -- Attempts at most once per session. Without this guard the block re-ran every frame
+  -- whenever no class was assigned, reloading storage for the whole grid each time and
+  -- starving the leaderboard.
+  if not classReloadAttempted and #releaseClasses == 0 and driverCount > 0 then
+    classReloadAttempted = true
     LoadManualClassesFromStorage()
     if #releaseClasses > 0 then
       BuildClassInfo()
       if IsEnduranceMode() then
         RecordStartingPositions()
         ReorderGridByClass()
+        gridReordered = true
       end
     end
   end
@@ -1288,14 +1373,22 @@ function script.update(dt)
     leaderboardOpened = true
   end
 
-  if IsEnduranceMode() and not sim.isSessionStarted then
+  -- Runs once per session only. Previously this executed every frame while the session
+  -- had not started, continuously rewriting the grid and starving the leaderboard.
+  if IsEnduranceMode() and not sim.isSessionStarted and not gridReordered then
     for i = 0, driverCount - 1 do
       local car = getCar(i)
       if car then
         allDriversStartingPos[i] = car.racePosition
       end
     end
-    ReorderGridByClass()
+    local okReorder, reorderErr = pcall(ReorderGridByClass)
+    if okReorder then
+      gridReordered = true
+      Log("PRE-START: grid reordered once by class")
+    else
+      Log("PRE-START: ReorderGridByClass FAILED err=" .. tostring(reorderErr))
+    end
   end
 
   if IsEnduranceMode() then
@@ -1492,6 +1585,8 @@ ac.onSessionStart(function()
   playerStoppedState  = false
   raceDisplayStable   = nil
   raceDisplayPending  = nil
+  gridReordered       = false
+  classReloadAttempted = false
   carClassCache       = {}
   allDriversStartingPos = {}
   uiSourceCache       = {}
