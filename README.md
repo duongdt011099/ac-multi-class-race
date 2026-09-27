@@ -90,6 +90,8 @@ The file is a JSON array with one entry per car that has set a lap time:
 
 Auto-save only runs in Qualifying/Practice sessions — it never writes results during a race.
 
+If the default folder cannot be resolved or is not writable, the app reports the reason in the config window and shows a warning instead of failing silently.
+
 ## How Classes Work
 
 Classes are **not auto-detected**. To set up classes:

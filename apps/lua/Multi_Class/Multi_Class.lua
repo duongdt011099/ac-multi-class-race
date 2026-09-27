@@ -6,6 +6,9 @@ local leaderboardOpened           = false
 local lastSessionIndex            = nil
 local lastSessionStarted          = nil
 local playerStoppedState          = false
+local raceDisplayStable           = nil
+local raceDisplayPending          = nil
+local RACE_POS_STABLE_FRAMES      = 2
 
 local driverClass                 = {}
 local classOrder                  = {}
@@ -538,13 +541,59 @@ local function NormalizePath(p)
 end
 
 local function QualiDefaultFolder()
-  if type(ac.dirname) == "function" then
-    local ok, d = pcall(function() return ac.dirname() end)
-    if ok and type(d) == "string" and d ~= "" then
-      return NormalizePath(d)
+  local candidates = {}
+
+  local ok1, d1 = pcall(function() return ac.dirname() end)
+  if ok1 and type(d1) == "string" and d1 ~= "" then
+    candidates[#candidates + 1] = d1
+  end
+
+  local ok2, d2 = pcall(function() return ac.getFolder(ac.FolderID.ExtLua) end)
+  if ok2 and type(d2) == "string" and d2 ~= "" then
+    candidates[#candidates + 1] = d2
+  end
+
+  local ok3, d3 = pcall(function() return io.relative(".") end)
+  if ok3 and type(d3) == "string" and d3 ~= "" then
+    candidates[#candidates + 1] = d3
+  end
+
+  for _, c in ipairs(candidates) do
+    local n = NormalizePath(c)
+    if n ~= "" then
+      return n
     end
   end
   return ""
+end
+
+local function QualiFolderWritable(folder)
+  if folder == "" then return false, "no folder" end
+  pcall(function()
+    if type(io.createDir) == "function" then io.createDir(folder) end
+  end)
+  if type(io.dirExists) == "function" then
+    local okE, exists = pcall(io.dirExists, folder)
+    if okE and exists == false then
+      return false, "folder does not exist"
+    end
+  end
+  if type(io.save) ~= "function" then
+    return true, nil
+  end
+  local probe = folder .. "/.mcr_write_test.tmp"
+  local okW = pcall(function()
+    if not io.save(probe, "") then
+      error("io.save returned false")
+    end
+  end)
+  pcall(function()
+    if type(io.deleteFile) == "function" then io.deleteFile(probe) end
+  end)
+  if not okW then
+    return false, "folder is not writable"
+  end
+  return true, nil
 end
 
 local function QualiEffectiveFolder()
@@ -635,11 +684,23 @@ local function StartQualiPolling()
   local folder = QualiEffectiveFolder()
   if folder == "" then
     qualiTargetPath = ""
+    local msg = "No save folder available - please choose one with 'Choose save folder...'"
+    if qualiSaveStatus ~= msg then
+      qualiSaveStatus = msg
+      ui.toast(ui.Icons.Warning, msg)
+    end
     return
   end
-  pcall(function()
-    if type(io.createDir) == "function" then io.createDir(folder) end
-  end)
+  local writable, why = QualiFolderWritable(folder)
+  if not writable then
+    qualiTargetPath = ""
+    local msg = "Cannot save quali result: " .. tostring(why) .. " (" .. folder .. ")"
+    if qualiSaveStatus ~= msg then
+      qualiSaveStatus = msg
+      ui.toast(ui.Icons.Warning, msg)
+    end
+    return
+  end
   local stamp = type(os.date) == "function" and os.date("%Y%m%d_%H%M%S") or "session"
   qualiTargetPath = folder .. "/qualifying-result_" .. stamp .. ".json"
   if type(setInterval) ~= "function" then
@@ -896,23 +957,53 @@ local function GetPlayerPositions()
     gapBehind = nil
   end
 
-  local enginePos = nil
-  local okEp, ep = pcall(function() return getCar(0).racePosition end)
-  if okEp and type(ep) == "number" and ep > 0 then
-    enginePos = ep
+  -- CSP computes car.racePosition every frame; ac.getCarLeaderboardPosition() is the
+  -- legacy Python leaderboard and returns a frozen classification, so it must not be used here.
+  local function EnginePos(idx)
+    local ok, p = pcall(function() return getCar(idx).racePosition end)
+    if ok and type(p) == "number" and p > 0 then
+      return p
+    end
+    return nil
   end
 
+  local enginePos = EnginePos(0)
   if enginePos then
-    overallPos = enginePos
+    local pendingPos = raceDisplayPending
+    if pendingPos and pendingPos.value == enginePos then
+      pendingPos.frames = pendingPos.frames + 1
+    else
+      pendingPos = { value = enginePos, frames = 1 }
+      raceDisplayPending = pendingPos
+    end
+
+    local stable = enginePos
+    if pendingPos.frames >= RACE_POS_STABLE_FRAMES then
+      raceDisplayStable = enginePos
+    elseif raceDisplayStable and raceDisplayStable > 0 then
+      stable = raceDisplayStable
+    end
+
+    overallPos = stable
     classPos = 1
     for _, car in ipairs(classCars) do
       if car.idx ~= 0 then
-        local okR, rp = pcall(function() return getCar(car.idx).racePosition end)
-        if okR and type(rp) == "number" and rp > 0 and rp < enginePos then
+        local rp = EnginePos(car.idx)
+        if rp and rp < stable then
           classPos = classPos + 1
         end
       end
     end
+  else
+    -- Engine has no classification for this car (pre-start, pits, retired): keep showing
+    -- the last known good position instead of snapping back to a progress-derived guess.
+    if raceDisplayStable and raceDisplayStable > 0 then
+      overallPos = raceDisplayStable
+    end
+  end
+
+  if not sim.isSessionStarted or stopped then
+    raceDisplayPending = nil
   end
 
   return overallPos, totalCars, classPos, classTotal, gapFront, gapBehind, currentLap, totalLaps, stopped
@@ -1282,9 +1373,14 @@ function script.clConfig()
         RestartQualiPolling()
       end
     else
-      ui.textColored("Save folder: Default (app folder)", rgbm(0.6, 0.6, 0.7, 1))
-      if ui.itemHovered() then
-        ui.setTooltip(QualiDefaultFolder())
+      local resolved = QualiEffectiveFolder()
+      if resolved ~= "" then
+        ui.textColored("Save folder: " .. resolved .. " (default)", rgbm(0.6, 0.6, 0.7, 1))
+        if ui.itemHovered() then
+          ui.setTooltip("Default location (app folder). Click 'Choose save folder...' to change it.")
+        end
+      else
+        ui.textColored("Save folder: not resolved - please choose a folder", rgbm(1.0, 0.7, 0.35, 1))
       end
     end
     ui.setCursor(vec2(colX, ui.getCursor().y + 2))
@@ -1392,6 +1488,8 @@ ac.onSessionStart(function()
   firstFrame          = true
   raceHasStarted      = false
   playerStoppedState  = false
+  raceDisplayStable   = nil
+  raceDisplayPending  = nil
   carClassCache       = {}
   allDriversStartingPos = {}
   uiSourceCache       = {}
