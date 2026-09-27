@@ -915,7 +915,9 @@ local function GetPlayerPositions()
       totalCars = totalCars + 1
       allCars[#allCars + 1] = { idx = i, prog = prog }
 
-      if driverClass[i] == playerClass then
+      -- playerClass can be nil when no class could be resolved; without this guard
+      -- 'nil == nil' would match every car and inflate classTotal up to totalCars.
+      if playerClass and driverClass[i] == playerClass then
         classTotal = classTotal + 1
         classCars[#classCars + 1] = { idx = i, prog = prog }
       end
@@ -1002,10 +1004,6 @@ local function GetPlayerPositions()
     end
   end
 
-  if not sim.isSessionStarted or stopped then
-    raceDisplayPending = nil
-  end
-
   return overallPos, totalCars, classPos, classTotal, gapFront, gapBehind, currentLap, totalLaps, stopped
 end
 
@@ -1023,7 +1021,7 @@ local function GetPlayerPositionsQuali()
       local best = GetCarBestLapMs(i)
       totalCars = totalCars + 1
       allCars[#allCars + 1] = { idx = i, best = best }
-      if driverClass[i] == playerClass then
+      if playerClass and driverClass[i] == playerClass then
         classTotal = classTotal + 1
         classCars[#classCars + 1] = { idx = i, best = best }
       end
@@ -1164,7 +1162,11 @@ function script.clLeaderboard(dt)
   local lapTotalText = (totalLaps or 0) > 0 and sFormat("%d", totalLaps) or nil
   DrawPanel(padX, "LAP", sFormat("%d", math.max(1, currentLap)), lapTotalText, rgbm(0.95, 0.95, 1, 1))
   DrawPanel(padX + panelW + gap, "OVERALL", sFormat("%d", overallPos), sFormat("%d", totalCars), rgbm(0.95, 0.95, 1, 1))
-  DrawPanel(padX + 2 * (panelW + gap), "CLASS", sFormat("%d", classPos), sFormat("%d", classTotal), rgbm(0.35, 0.95, 0.45, 1))
+  if classTotal > 0 then
+    DrawPanel(padX + 2 * (panelW + gap), "CLASS", sFormat("%d", classPos), sFormat("%d", classTotal), rgbm(0.35, 0.95, 0.45, 1))
+  else
+    DrawPanel(padX + 2 * (panelW + gap), "CLASS", "-", "no class", rgbm(0.55, 0.55, 0.6, 1))
+  end
 
   if qualiMode then
     local posY = gapPanelTop + gapPanelH / 2
