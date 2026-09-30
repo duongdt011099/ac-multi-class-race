@@ -11,7 +11,7 @@ A CSP Lua app for Assetto Corsa that provides class-based position tracking and 
 - **Time gap display** — See the time gap to the nearest class car ahead (+) and behind (-)
 - **Manual class assignment** — You define class names; cars matching that tag/class are assigned
 - **Persistent settings** — Class assignments are saved and persist across sessions
-- **Qualifying/Practice auto-save** — Automatically export every car's best lap time to a JSON file each second during qualifying and practice sessions
+- **Automatic session result export** — Writes a JSON result once when a Race, Qualifying or Practice session finishes, ready to import into the dashboard
 
 ## Requirements
 
@@ -55,21 +55,33 @@ The leaderboard overlay shows during your session:
 
 <img width="317" height="183" alt="image" src="https://github.com/user-attachments/assets/95ea3d53-74e8-49f1-98a4-f809e8fd29a1" />
 
-### Qualifying / Practice Auto-Save
+### Automatic Session Result Export
 
-While driving in **Qualifying** or **Practice** sessions, the app can automatically export the best lap times of every car on track to a JSON file.
+The app can automatically export a session's result to a JSON file **once, when the session finishes**. This works for **Race**, **Qualifying** and **Practice**.
 
-**Enable it:** in the Config window, tick **"Auto-save Qualifying/Practice best-lap results (every second)"**. This option is only shown outside race sessions (qualifying, practice, and the main menu).
+**Default:** auto-save is checked on a fresh install. Existing saved preferences are respected. In the Config window, use **"Auto-save session result when the session finishes"** to change it; the checkbox is available in every session type, including Race.
 
-**Choose where to save:** click **"Choose save folder..."** to pick a destination folder. By default, results are written into the app's own folder (`apps\lua\Multi_Class\`). Use **"Reset to Default (app folder)"** to go back to the default. The status line below the controls shows where the results were last saved.
-
-**What happens:** while enabled, the app writes a fresh snapshot once every second during the session. A new file is created for each session, named with a timestamp:
+**Choose where to save:** click **"Choose result folder..."** to pick a destination. The default is:
 
 ```
-qualifying-result_YYYYMMDD_HHMMSS.json
+<My Documents>\Assetto Corsa\mcr-results\
 ```
 
-The file is a JSON array with one entry per car that has set a lap time:
+Each session type gets its own subfolder. Use **"Reset to Default"** to go back. The status line below the controls shows where the last result was written.
+
+**What happens:** when a session ends, the app writes a single file per session, named with the time the result was written:
+
+```
+mcr-results\practice\yyMMdd-HHmmss.json
+mcr-results\qualifying\yyMMdd-HHmmss.json
+mcr-results\race\yyMMdd-HHmmss.json
+```
+
+The file is written to a temporary `.tmp` name first and then renamed, so a reader can never pick up a half-written file. Each session is exported at most once; restarting the same session type produces a new file.
+
+#### Practice and Qualifying
+
+A JSON array with one entry per car that has set a lap time:
 
 ```json
 [
@@ -89,9 +101,43 @@ The file is a JSON array with one entry per car that has set a lap time:
 | `skin` | Car skin ID |
 | `bestLapTimeMs` | Best lap time, formatted `MM:SS.mmm` |
 
-Auto-save only runs in Qualifying/Practice sessions — it never writes results during a race.
+#### Race
 
-If the default folder cannot be resolved or is not writable, the app reports the reason in the config window and shows a warning instead of failing silently.
+A Content Manager compatible results file, so it can be loaded by Content Manager as well as the dashboard:
+
+```json
+{
+  "track": "monza",
+  "numberOfSessions": 1,
+  "players": [
+    { "name": "Driver Name", "car": "car_id", "skin": "skin_id" }
+  ],
+  "sessions": [
+    {
+      "type": 3,
+      "lapsCount": 12,
+      "lapsTotal": [12, 11, 10],
+      "bestLaps": [ { "car": 0, "lap": 12, "time": 91234 } ],
+      "raceResult": [0, 1, 2]
+    }
+  ]
+}
+```
+
+`raceResult` lists car indices in finishing order, and `bestLaps` only includes cars that actually set a time.
+
+If the result folder cannot be resolved or is not writable, the app reports the reason in the config window and shows a warning instead of failing silently.
+
+### Importing results into the dashboard
+
+When Assetto Corsa closes, the **Multi-Class Race Dashboard** scans the result folder and offers to import anything new it finds:
+
+- A **Yes/No prompt** appears with a **Race** picker, pre-selected to the session you launched from the dashboard. If that race cannot be determined, pick it manually.
+- Choosing **No** records the file as declined so it is not offered again.
+- Importing a Race result **replaces** the existing race session in that race, including its points.
+- Files you import yourself from the dashboard's **Race** tab are also recorded, so they are not offered twice.
+
+Previously imported or declined files are remembered, so restarting the dashboard will not re-prompt for them.
 
 ## How Classes Work
 

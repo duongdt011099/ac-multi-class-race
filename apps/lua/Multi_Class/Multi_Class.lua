@@ -22,15 +22,51 @@ local classAddError               = nil
 local carClassCache               = {}
 local uiSourceCache               = {}
 
-local storedSettings              = ac.storage({ enduranceEnabled = true, qualiSaveEnabled = false, qualiSaveFolder = "" })
+local storedSettings              = ac.storage({ enduranceEnabled = true, resultExportEnabled = true, resultFolder = "" })
 
 local enduranceEnabled           = true
 
-local qualiSaveEnabled           = false
-local qualiSaveFolder            = ""
-local qualiPollTimer             = nil
-local qualiTargetPath            = nil
-local qualiSaveStatus            = ""
+local resultExportEnabled        = true
+local resultFolder               = ""
+local resultExportStatus         = ""
+local exportedSessionKey         = nil
+local nextExportRetryAt          = 0
+local EXPORT_RETRY_SECONDS       = 2
+local resultResetAfterExport     = false
+local lastExportDiagnostic       = nil
+local lastExportCaptureError     = nil
+local lastExportUpdateDiagnostic = nil
+local lastExportTransitionError  = nil
+
+-- Snapshot of the session that is currently running. It is captured every frame while
+-- the session is alive because by the time the session has ended Assetto Corsa has
+-- already discarded the display name, the session index and the lap count, and the car
+-- may have been moved back to the pits. The result is therefore written from this
+-- snapshot, never from whatever the live state happens to be at the end.
+local liveSessionType            = nil
+local liveSessionKey             = nil
+local liveTrackName              = ""
+local liveTotalLaps              = 0
+local liveSessionPending         = false
+local liveSessionCars            = {}
+local liveSessionCarCount        = 0
+local liveSessionTimeLeft        = nil
+local liveSessionHadCountdown    = false
+
+-- The dashboard watches these subfolders and derives the session type from the
+-- folder name, so every file must be named exactly yyMMdd-HHmmss.json.
+local SUBFOLDER_PRACTICE         = "practice"
+local SUBFOLDER_QUALIFYING       = "qualifying"
+local SUBFOLDER_RACE             = "race"
+
+-- ac.StateSession.type and ac.SimState.raceSessionType are ac.SessionType enums, which
+-- survive the end of a session. The session *name* does not, which is why the export
+-- used to fail whenever the car returned to the pits. Values are hardcoded as a fallback
+-- for CSP builds that do not expose the enum table.
+local SESSION_TYPE_PRACTICE      = (ac.SessionType and ac.SessionType.Practice) or 1
+local SESSION_TYPE_QUALIFY       = (ac.SessionType and ac.SessionType.Qualify) or 2
+local SESSION_TYPE_RACE          = (ac.SessionType and ac.SessionType.Race) or 3
+local SESSION_TYPE_HOTLAP        = (ac.SessionType and ac.SessionType.Hotlap) or 4
 
 local mMin = math.min
 local sFormat = string.format
@@ -550,11 +586,34 @@ local function LoadManualClassesFromStorage()
     if storedSettings.enduranceEnabled ~= nil then
       enduranceEnabled = storedSettings.enduranceEnabled
     end
-    if storedSettings.qualiSaveEnabled ~= nil then
-      qualiSaveEnabled = storedSettings.qualiSaveEnabled
+    -- Probe legacy settings independently: ac.storage rejects undeclared keys, and a
+    -- failed legacy lookup must not abort restoration of the current settings below.
+    local legacyEnabledOk, legacyEnabled = pcall(function()
+      return storedSettings.qualiSaveEnabled
+    end)
+    local legacyFolderOk, legacyFolder = pcall(function()
+      return storedSettings.qualiSaveFolder
+    end)
+
+    if legacyEnabledOk and legacyEnabled ~= nil then
+      resultExportEnabled = legacyEnabled
+      storedSettings.resultExportEnabled = legacyEnabled
+    elseif storedSettings.resultExportEnabled ~= nil then
+      resultExportEnabled = storedSettings.resultExportEnabled
     end
-    if storedSettings.qualiSaveFolder ~= nil then
-      qualiSaveFolder = NormalizePath(storedSettings.qualiSaveFolder or "")
+
+    if legacyFolderOk and legacyFolder ~= nil then
+      resultFolder = NormalizePath(legacyFolder or "")
+      storedSettings.resultFolder = resultFolder
+    elseif storedSettings.resultFolder ~= nil then
+      resultFolder = NormalizePath(storedSettings.resultFolder or "")
+    end
+
+    if legacyEnabledOk then
+      pcall(function() storedSettings.qualiSaveEnabled = nil end)
+    end
+    if legacyFolderOk then
+      pcall(function() storedSettings.qualiSaveFolder = nil end)
     end
   end)
   if not okSettings then
@@ -567,24 +626,105 @@ local function LoadManualClassesFromStorage()
   end
 end
 
-local function GetSessionNameLower()
-  local sim = ac.getSim()
+local function GetSessionNameLower(sim)
+  sim = sim or ac.getSim()
   local ok, name = pcall(function() return ac.getSessionName(sim.currentSessionIndex) end)
   if not ok or not name then return "" end
   return string.lower(name)
 end
 
-local function IsRaceMode()
-  return GetSessionNameLower():find("race") ~= nil
+local function IsRaceMode(sim)
+  return GetSessionNameLower(sim):find("race") ~= nil
 end
 
 local function IsEnduranceMode()
   return enduranceEnabled and IsRaceMode()
 end
 
-local function IsQualiPracticeMode()
-  local sn = GetSessionNameLower()
+local function IsQualiPracticeMode(sim)
+  local sn = GetSessionNameLower(sim)
   return sn:find("qualifying") ~= nil or sn:find("practice") ~= nil
+end
+
+-- The dashboard derives the session type from the subfolder the result lands in, so these
+-- three names are a contract with Services/LuaResultPaths.cs.
+--
+-- Resolved from the ac.SessionType enum rather than the session display name: the name is
+-- already gone by the time the session ends and the car returns to the pits, which made
+-- the export silently produce nothing. Hotlap is a practice-style session, so it is
+-- reported as practice instead of being dropped.
+local function SessionTypeToFolder(sessionType)
+  if type(sessionType) ~= "number" then return nil end
+  if sessionType == SESSION_TYPE_RACE then return SUBFOLDER_RACE end
+  if sessionType == SESSION_TYPE_QUALIFY then return SUBFOLDER_QUALIFYING end
+  if sessionType == SESSION_TYPE_PRACTICE or sessionType == SESSION_TYPE_HOTLAP then
+    return SUBFOLDER_PRACTICE
+  end
+  return nil
+end
+
+-- Reads the live session type from the session object, falling back to the sim's
+-- raceSessionType. Only valid while the session is still running.
+local function ReadLiveSessionType(sim)
+  sim = sim or ac.getSim()
+
+  if ac.getSession then
+    local okSession, session = pcall(ac.getSession, sim.currentSessionIndex)
+    if okSession and session then
+      local okType, sessionType = pcall(function() return session.type end)
+      if okType and type(sessionType) == "number" then return sessionType end
+    end
+  end
+
+  local okRace, raceType = pcall(function() return sim.raceSessionType end)
+  if okRace and type(raceType) == "number" then return raceType end
+
+  return nil
+end
+
+-- Only used as a fallback when the app starts while results are already on screen, where
+-- the enum is unavailable and the display name is all there is.
+local function GetExportSessionType()
+  if IsRaceMode() then return SUBFOLDER_RACE end
+  if not IsQualiPracticeMode() then return nil end
+  if GetSessionNameLower():find("qualifying") ~= nil then return SUBFOLDER_QUALIFYING end
+  return SUBFOLDER_PRACTICE
+end
+
+local function GetTrackNameSafe()
+  if ac.getTrackName then
+    local ok, name = pcall(ac.getTrackName)
+    if ok and type(name) == "string" and name ~= "" then return name end
+  end
+  return ""
+end
+
+local function GetCurrentSessionKey(sim)
+  sim = sim or ac.getSim()
+  local name = ""
+  local ok, n = pcall(function() return ac.getSessionName(sim.currentSessionIndex) end)
+  if ok and type(n) == "string" then name = n end
+  return sFormat("%s:%s", tostring(sim.currentSessionIndex), name)
+end
+
+-- ac.StateSession.isOver and sim.isLookingAtSessionResults are the two documented
+-- "this session is done" signals; either one means the result is final.
+local function IsSessionFinished(sim)
+  sim = sim or ac.getSim()
+  if sim.isInMainMenu == true then return false end
+
+  local okResults, showingResults = pcall(function() return sim.isLookingAtSessionResults end)
+  if okResults and showingResults == true then return true end
+
+  if ac.getSession then
+    local okSession, session = pcall(ac.getSession, sim.currentSessionIndex)
+    if okSession and session then
+      local okOver, isOver = pcall(function() return session.isOver end)
+      if okOver and isOver == true then return true end
+    end
+  end
+
+  return false
 end
 
 local function FormatLapMs(ms)
@@ -598,10 +738,22 @@ end
 
 local function JsonEscape(s)
   s = tostring(s or "")
-  return s:gsub("\\", "\\\\"):gsub('"', '\\"')
+  -- Control characters must be escaped too: a driver name containing a raw newline
+  -- or tab would otherwise produce invalid JSON.
+  s = s:gsub("\\", "\\\\"):gsub('"', '\\"')
+  s = s:gsub("\n", "\\n"):gsub("\r", "\\r"):gsub("\t", "\\t")
+  s = s:gsub("[\1-\31]", function(c) return sFormat("\\u%04x", string.byte(c)) end)
+  return s
 end
 
-local function QualiDefaultFolder()
+local function ResultDefaultFolder()
+  -- Matches the dashboard default (Services/LuaResultPaths.cs) so the common case
+  -- needs no configuration on either side.
+  local okDocs, docs = pcall(function() return ac.getFolder(ac.FolderID.Documents) end)
+  if okDocs and type(docs) == "string" and docs ~= "" then
+    return NormalizePath(docs .. "/Assetto Corsa/mcr-results")
+  end
+
   local candidates = {}
 
   local ok1, d1 = pcall(function() return ac.dirname() end)
@@ -614,11 +766,6 @@ local function QualiDefaultFolder()
     candidates[#candidates + 1] = d2
   end
 
-  local ok3, d3 = pcall(function() return io.relative(".") end)
-  if ok3 and type(d3) == "string" and d3 ~= "" then
-    candidates[#candidates + 1] = d3
-  end
-
   for _, c in ipairs(candidates) do
     local n = NormalizePath(c)
     if n ~= "" then
@@ -628,7 +775,7 @@ local function QualiDefaultFolder()
   return ""
 end
 
-local function QualiFolderWritable(folder)
+local function ResultFolderWritable(folder)
   if folder == "" then return false, "no folder" end
   pcall(function()
     if type(io.createDir) == "function" then io.createDir(folder) end
@@ -657,39 +804,162 @@ local function QualiFolderWritable(folder)
   return true, nil
 end
 
-local function QualiEffectiveFolder()
-  if qualiSaveFolder and qualiSaveFolder ~= "" then
-    return qualiSaveFolder
+local function ResultEffectiveFolder()
+  if resultFolder and resultFolder ~= "" then
+    return resultFolder
   end
-  return QualiDefaultFolder()
+  return ResultDefaultFolder()
 end
 
-local function BuildQualiResultJson()
-  local entries = {}
+local function GetCarIdentity(i)
+  local identity = { driver = "", car = "", skin = "" }
+
+  local okD, d = pcall(function() return ac.getDriverName and ac.getDriverName(i) end)
+  if okD and type(d) == "string" then identity.driver = d end
+
+  local okC, c = pcall(function() return ac.getCarID and ac.getCarID(i) end)
+  if okC and type(c) == "string" then identity.car = c end
+
+  local okS, s = pcall(function() return ac.getCarSkinID and ac.getCarSkinID(i) end)
+  if okS and type(s) == "string" then identity.skin = s end
+
+  return identity
+end
+
+local function GetCarLapData(i)
+  local data = {
+    available = false,
+    lapCount = 0,
+    bestMs = 0,
+    position = 0,
+    inPit = nil,
+    inPitlane = nil,
+  }
+  local okCar, car = pcall(getCar, i)
+  if not okCar or not car then return data end
+  data.available = true
+
+  local okL, lc = pcall(function() return car.lapCount end)
+  if okL and type(lc) == "number" and lc > 0 then data.lapCount = lc end
+
+  local okB, bt = pcall(function() return car.bestLapTimeMs end)
+  if okB and type(bt) == "number" and bt > 0 then data.bestMs = bt end
+
+  local okP, p = pcall(function() return car.racePosition end)
+  if okP and type(p) == "number" and p > 0 then data.position = p end
+
+  local okPit, inPit = pcall(function() return car.isInPit end)
+  if okPit and type(inPit) == "boolean" then data.inPit = inPit end
+
+  local okPitlane, inPitlane = pcall(function() return car.isInPitlane end)
+  if okPitlane and type(inPitlane) == "boolean" then data.inPitlane = inPitlane end
+
+  return data
+end
+
+-- Keep a recent copy of every car's identity and result data while AC still exposes the
+-- grid. `sim.carsCount` can become zero as soon as a timed session ends, so export must
+-- never depend on live car objects after that transition.
+local function CaptureLiveCarResults()
+  if driverCount <= 0 then return end
+
+  local cars = {}
+  local availableCars = 0
   for i = 0, driverCount - 1 do
-    local okCar, car = pcall(getCar, i)
-    local bt = nil
-    if okCar and car then
-      local okBt, v = pcall(function() return car.bestLapTimeMs end)
-      if okBt and type(v) == "number" and v > 0 then
-        bt = v
-      end
+    local identity = GetCarIdentity(i)
+    local lapData = GetCarLapData(i)
+    cars[#cars + 1] = {
+      index = i,
+      driver = identity.driver,
+      car = identity.car,
+      skin = identity.skin,
+      lapCount = lapData.lapCount,
+      bestMs = lapData.bestMs,
+      position = lapData.position,
+      inPit = lapData.inPit,
+      inPitlane = lapData.inPitlane,
+    }
+    if lapData.available or identity.driver ~= "" or identity.car ~= "" then
+      availableCars = availableCars + 1
     end
-    if bt then
-      local driver = ""
-      local okD, d = pcall(function() return ac.getDriverName and ac.getDriverName(i) end)
-      if okD and type(d) == "string" then driver = d end
-      local carID = ""
-      local okC, c = pcall(function() return ac.getCarID and ac.getCarID(i) end)
-      if okC and type(c) == "string" then carID = c end
-      local skin = ""
-      local okS, s = pcall(function() return ac.getCarSkinID and ac.getCarSkinID(i) end)
-      if okS and type(s) == "string" then skin = s end
+  end
+
+  -- Keep the last good copy if AC briefly reports a grid before populating its car data.
+  if availableCars > 0 then
+    liveSessionCars = cars
+    liveSessionCarCount = #cars
+  end
+end
+
+-- Snapshots everything the result needs while the session is still alive. Called every
+-- frame while sim.isSessionStarted is true, so the last successful call before the
+-- session ends holds metadata and car results even after AC reports zero cars.
+local function CaptureLiveSession(sim)
+  sim = sim or ac.getSim()
+  if sim.isSessionStarted ~= true then return end
+
+  local folder = SessionTypeToFolder(ReadLiveSessionType(sim))
+  if folder == nil then return end
+
+  local laps = 0
+  if ac.getSession then
+    local okSession, session = pcall(ac.getSession, sim.currentSessionIndex)
+    if okSession and session then
+      local okLaps, sessionLaps = pcall(function() return session.laps end)
+      if okLaps and type(sessionLaps) == "number" and sessionLaps > 0 then laps = sessionLaps end
+    end
+  end
+
+  liveSessionType    = folder
+  liveSessionKey     = GetCurrentSessionKey(sim)
+  liveTrackName      = GetTrackNameSafe()
+  liveTotalLaps      = laps
+  local okTimeLeft, timeLeft = pcall(function() return sim.sessionTimeLeft end)
+  if okTimeLeft and type(timeLeft) == "number" then
+    liveSessionTimeLeft = timeLeft
+    if timeLeft > 0 then liveSessionHadCountdown = true end
+  end
+  CaptureLiveCarResults()
+end
+
+-- Called when a session ends, to arm the export. The result is written from the snapshot
+-- on the next frame, outside the session-validity check and without requiring live cars.
+local function ArmSessionEnded()
+  if liveSessionType == nil then return end
+  if exportedSessionKey ~= nil and exportedSessionKey == liveSessionKey then return end
+  local wasPending = liveSessionPending
+  liveSessionPending = true
+  if not wasPending then
+    Log("EXPORT: session ended, pending export for " .. tostring(liveSessionType) ..
+        " key=" .. tostring(liveSessionKey) .. " cars=" .. tostring(liveSessionCarCount))
+  end
+end
+
+-- Called when a new session starts, so a previous session's snapshot cannot leak into it.
+local function ClearLiveSession()
+  liveSessionType     = nil
+  liveSessionKey      = nil
+  liveTrackName       = ""
+  liveTotalLaps       = 0
+  liveSessionPending  = false
+  liveSessionCars     = {}
+  liveSessionCarCount = 0
+  liveSessionTimeLeft = nil
+  liveSessionHadCountdown = false
+end
+
+-- Practice / Qualifying: a bare array of best laps, read by
+-- RaceService.ImportSessionResultAsync.
+local function BuildSessionResultJson()
+  local entries = {}
+
+  for _, carData in ipairs(liveSessionCars) do
+    if carData.bestMs > 0 then
       entries[#entries + 1] = {
-        driver = JsonEscape(driver),
-        car = JsonEscape(carID),
-        skin = JsonEscape(skin),
-        best = FormatLapMs(bt)
+        driver = JsonEscape(carData.driver),
+        car = JsonEscape(carData.car),
+        skin = JsonEscape(carData.skin),
+        best = FormatLapMs(carData.bestMs)
       }
     end
   end
@@ -707,86 +977,448 @@ local function BuildQualiResultJson()
   return table.concat(out, "\n")
 end
 
-local function SaveQualiResult(showToast)
-  if not qualiTargetPath or qualiTargetPath == "" then return end
-  local ok, err = pcall(function()
-    local okSaved = io.save(qualiTargetPath, BuildQualiResultJson())
-    if not okSaved then
-      error("io.save returned false")
+-- Race: a Content Manager compatible session file, read by
+-- RaceService.ImportRaceResultAsync. Emitting the same shape means the existing
+-- importer, class classification and points award all work unchanged.
+local function BuildRaceResultJson(trackName, totalLaps)
+  local players = {}
+  local lapsTotal = {}
+  local bestLaps = {}
+  local order = {}
+
+  for _, carData in ipairs(liveSessionCars) do
+    players[#players + 1] = sFormat(
+      '    { "name": "%s", "car": "%s", "skin": "%s" }',
+      JsonEscape(carData.driver),
+      JsonEscape(carData.car),
+      JsonEscape(carData.skin))
+
+    lapsTotal[#lapsTotal + 1] = tostring(carData.lapCount)
+
+    if carData.bestMs > 0 then
+      bestLaps[#bestLaps + 1] = sFormat(
+        '    { "car": %d, "lap": %d, "time": %d }',
+        carData.index,
+        carData.lapCount,
+        carData.bestMs)
     end
-    return true
+
+    order[#order + 1] = {
+      index = carData.index,
+      position = carData.position > 0 and carData.position or (carData.index + 1),
+    }
+  end
+
+  table.sort(order, function(a, b)
+    if a.position == b.position then return a.index < b.index end
+    return a.position < b.position
   end)
-  if ok then
-    local stamp = type(os.date) == "function" and os.date("%H:%M:%S") or ""
-    qualiSaveStatus = "Last saved " .. stamp .. " -> " .. qualiTargetPath
-    if showToast then
-      ui.toast(ui.Icons.Play, "Quali result saved")
-    end
-  else
-    local msg = "Failed to save quali result: " .. tostring(err)
-    if qualiSaveStatus ~= msg then
-      qualiSaveStatus = msg
-      ui.toast(ui.Icons.Warning, msg)
-    end
+
+  local raceResult = {}
+  for k, entry in ipairs(order) do
+    raceResult[k] = tostring(entry.index)
   end
+
+  local out = { "{" }
+  out[#out + 1] = sFormat('  "track": "%s",', JsonEscape(trackName or ""))
+  out[#out + 1] = '  "numberOfSessions": 1,'
+  out[#out + 1] = '  "players": ['
+  out[#out + 1] = table.concat(players, ",\n")
+  out[#out + 1] = '  ],'
+  out[#out + 1] = '  "sessions": ['
+  out[#out + 1] = '    {'
+  out[#out + 1] = '      "event": 0,'
+  out[#out + 1] = '      "name": "Race",'
+  out[#out + 1] = '      "type": 3,'
+  out[#out + 1] = sFormat('      "lapsCount": %d,', totalLaps)
+  out[#out + 1] = '      "duration": 0,'
+  out[#out + 1] = '      "laps": [],'
+  out[#out + 1] = '      "lapsTotal": [' .. table.concat(lapsTotal, ", ") .. '],'
+  out[#out + 1] = '      "bestLaps": ['
+  out[#out + 1] = table.concat(bestLaps, ",\n")
+  out[#out + 1] = '      ],'
+  out[#out + 1] = '      "raceResult": [' .. table.concat(raceResult, ", ") .. ']'
+  out[#out + 1] = '    }'
+  out[#out + 1] = '  ]'
+  out[#out + 1] = "}"
+  return table.concat(out, "\n")
 end
 
-local function StopQualiPolling()
-  if qualiPollTimer then
-    pcall(function()
-      if type(clearInterval) == "function" then clearInterval(qualiPollTimer) end
-    end)
-    qualiPollTimer = nil
+-- Write to a temporary name and rename, so the dashboard can never pick up a
+-- partially written result file.
+local function WriteResultFile(targetPath, contents)
+  local tempPath = targetPath .. ".tmp"
+
+  if not io.save(tempPath, contents) then
+    error("io.save returned false")
   end
+
+  if type(os.rename) == "function" then
+    pcall(function() os.rename(tempPath, targetPath) end)
+
+    local exists = true
+    if type(io.fileExists) == "function" then
+      local ok, result = pcall(io.fileExists, targetPath)
+      exists = ok and result == true
+    end
+
+    if exists then
+      pcall(function()
+        if type(io.deleteFile) == "function" then io.deleteFile(tempPath) end
+      end)
+      return true
+    end
+  end
+
+  pcall(function()
+    if type(io.deleteFile) == "function" then io.deleteFile(tempPath) end
+  end)
+
+  if not io.save(targetPath, contents) then
+    error("io.save returned false")
+  end
+
+  return true
 end
 
-local function StartQualiPolling()
-  StopQualiPolling()
-  local folder = QualiEffectiveFolder()
-  if folder == "" then
-    qualiTargetPath = ""
-    local msg = "No save folder available - please choose one with 'Choose save folder...'"
-    if qualiSaveStatus ~= msg then
-      qualiSaveStatus = msg
-      ui.toast(ui.Icons.Warning, msg)
+-- Writes the result from the snapshot taken while the session was running. sessionKey is
+-- remembered on success so the same session can never be written twice.
+local function ExportSessionResult(sessionType, sessionKey, trackName, totalLaps, silent, force)
+  -- A failed export is retried rather than abandoned, but the results screen can sit for
+  -- minutes and each attempt probes the folder and rebuilds the JSON, so the retries are
+  -- throttled instead of running on every frame.
+  if not force and type(os.time) == "function" then
+    local now = os.time()
+    if now < nextExportRetryAt then return end
+    nextExportRetryAt = now + EXPORT_RETRY_SECONDS
+  end
+
+  if sessionType == nil then return end
+
+  local root = ResultEffectiveFolder()
+  if root == "" then
+    local msg = "No result folder available - choose one with 'Choose result folder...'"
+    if resultExportStatus ~= msg then
+      resultExportStatus = msg
+      Log("EXPORT: " .. msg)
+      if not silent then ui.toast(ui.Icons.Warning, msg) end
     end
     return
   end
-  local writable, why = QualiFolderWritable(folder)
+
+  local targetDir = root .. "/" .. sessionType
+  local writable, why = ResultFolderWritable(targetDir)
   if not writable then
-    qualiTargetPath = ""
-    local msg = "Cannot save quali result: " .. tostring(why) .. " (" .. folder .. ")"
-    if qualiSaveStatus ~= msg then
-      qualiSaveStatus = msg
-      ui.toast(ui.Icons.Warning, msg)
+    local msg = "Cannot save session result: " .. tostring(why) .. " (" .. targetDir .. ")"
+    if resultExportStatus ~= msg then
+      resultExportStatus = msg
+      Log("EXPORT: " .. msg)
+      if not silent then ui.toast(ui.Icons.Warning, msg) end
     end
     return
   end
-  local stamp = type(os.date) == "function" and os.date("%Y%m%d_%H%M%S") or "session"
-  qualiTargetPath = folder .. "/qualifying-result_" .. stamp .. ".json"
-  if type(setInterval) ~= "function" then
-    SaveQualiResult(false)
+
+  if type(os.date) ~= "function" then
+    local msg = "os.date is unavailable on this CSP version - cannot name the result file."
+    if resultExportStatus ~= msg then
+      resultExportStatus = msg
+      Log("EXPORT: " .. msg)
+      if not silent then ui.toast(ui.Icons.Warning, msg) end
+    end
     return
   end
-  local okI, id = pcall(function()
-    return setInterval(function()
-      pcall(SaveQualiResult, false)
-    end, 1.0, "multi_class_quali_result_save")
+
+  local fileName = os.date("%y%m%d-%H%M%S") .. ".json"
+  local targetPath = targetDir .. "/" .. fileName
+  local contents = (sessionType == SUBFOLDER_RACE)
+      and BuildRaceResultJson(trackName, totalLaps)
+      or BuildSessionResultJson()
+
+  Log("EXPORT: writing " .. targetPath)
+  local ok, err = pcall(function()
+    WriteResultFile(targetPath, contents)
   end)
-  if okI and id then
-    qualiPollTimer = id
-    SaveQualiResult(true)
+
+  if ok then
+    exportedSessionKey = sessionKey
+    liveSessionPending = false
+    resultExportStatus = sFormat(
+      "Saved %s result at %s -> %s/%s",
+      sessionType,
+      os.date("%H:%M:%S"),
+      sessionType,
+      fileName)
+    if not silent then ui.toast(ui.Icons.Play, "Session result saved") end
+    Log("EXPORT: wrote " .. targetPath)
   else
-    SaveQualiResult(false)
+    -- exportedSessionKey is left unset so the next frame retries rather than
+    -- silently losing the session result.
+    local msg = "Failed to save session result: " .. tostring(err)
+    if resultExportStatus ~= msg then
+      resultExportStatus = msg
+      if not silent then ui.toast(ui.Icons.Warning, msg) end
+    end
+    Log("EXPORT: FAILED err=" .. tostring(err))
   end
 end
 
-local function RestartQualiPolling()
-  if qualiSaveEnabled and IsQualiPracticeMode() then
-    StartQualiPolling()
+-- Called once per frame from script.update. Writes at most once per session.
+--
+-- The primary trigger is the armed end-of-session flag, not the results screen: when the
+-- car returns to the pits the results screen may never appear and the session name is
+-- already gone. The results-screen check is kept as a secondary trigger for the case
+-- where the app starts while results are already on screen.
+local function CheckForFinishedSession(sim)
+  if not resultExportEnabled then return end
+  if liveSessionType == nil then return end
+  if liveSessionCarCount <= 0 then return end
+  if liveSessionPending == false and not IsSessionFinished(sim) then return end
+  if exportedSessionKey ~= nil and exportedSessionKey == liveSessionKey then return end
+
+  ExportSessionResult(liveSessionType, liveSessionKey, liveTrackName, liveTotalLaps)
+end
+
+-- Only called when a new session begins. Resetting on the end of a session instead would
+-- clear the guard that stops the result being written twice.
+local function ResetResultExport()
+  exportedSessionKey = nil
+  nextExportRetryAt = 0
+  ClearLiveSession()
+end
+
+local function CaptureLiveSessionSafely(sim)
+  local ok, err = pcall(CaptureLiveSession, sim)
+  if ok then
+    lastExportCaptureError = nil
   else
-    StopQualiPolling()
+    local message = tostring(err)
+    if message ~= lastExportCaptureError then
+      Log("EXPORT: live-session capture failed: " .. message)
+      lastExportCaptureError = message
+    end
   end
+end
+
+local function CheckForFinishedSessionSafely(sim)
+  local ok, err = pcall(CheckForFinishedSession, sim)
+  if not ok then
+    Log("EXPORT: finish check failed: " .. tostring(err))
+  end
+end
+
+local function IsPlayerInPit()
+  local okCar, car = pcall(getCar, 0)
+  if okCar and car then
+    local observed = false
+    local okPit, inPit = pcall(function() return car.isInPit end)
+    if okPit and type(inPit) == "boolean" then
+      observed = true
+      if inPit then return true end
+    end
+    local okPitlane, inPitlane = pcall(function() return car.isInPitlane end)
+    if okPitlane and type(inPitlane) == "boolean" then
+      observed = true
+      if inPitlane then return true end
+    end
+    if observed then return false end
+  end
+
+  -- AC can remove car objects at session teardown. Use the last live observation in that
+  -- case; the live session snapshot is refreshed every frame until the grid disappears.
+  local playerSnapshot = liveSessionCars[1]
+  if playerSnapshot then
+    if playerSnapshot.inPit == true or playerSnapshot.inPitlane == true then return true end
+    if playerSnapshot.inPit == false and playerSnapshot.inPitlane == false then return false end
+  end
+  return nil
+end
+
+local function ExportExpiredSessionOnRelease()
+  local currentTimeLeft = liveSessionTimeLeft
+  local okSim, sim = pcall(ac.getSim)
+  if okSim and sim then
+    local okTime, timeLeft = pcall(function() return sim.sessionTimeLeft end)
+    if okTime and type(timeLeft) == "number" then currentTimeLeft = timeLeft end
+  end
+
+  Log(sFormat(
+    "EXPORT: release check enabled=%s type=%s key=%s snapshotCars=%d hadCountdown=%s leftMs=%s exported=%s",
+    tostring(resultExportEnabled), tostring(liveSessionType), tostring(liveSessionKey),
+    liveSessionCarCount, tostring(liveSessionHadCountdown), tostring(currentTimeLeft),
+    tostring(exportedSessionKey == liveSessionKey)))
+
+  if not resultExportEnabled then return end
+  if liveSessionType == nil or liveSessionCarCount <= 0 then return end
+  if not liveSessionHadCountdown or type(currentTimeLeft) ~= "number" or currentTimeLeft > 0 then return end
+  if exportedSessionKey ~= nil and exportedSessionKey == liveSessionKey then return end
+
+  liveSessionPending = true
+  local ok, err = pcall(
+    ExportSessionResult,
+    liveSessionType,
+    liveSessionKey,
+    liveTrackName,
+    liveTotalLaps,
+    true,
+    true)
+  if not ok then
+    Log("EXPORT: release fallback failed: " .. tostring(err))
+  end
+end
+
+-- Emit one diagnostic line whenever AC's export-relevant state changes. This makes it
+-- possible to distinguish a missed end transition from a missing session type, empty car
+-- snapshot, disabled setting, or an actual write failure without logging every frame.
+local function LogExportState(sim, sessionEnded, sessionBegan, sessionSwitched)
+  local sessionType = ReadLiveSessionType(sim)
+  local sessionTimeLeft = nil
+  local okTimeLeft, timeLeft = pcall(function() return sim.sessionTimeLeft end)
+  if okTimeLeft and type(timeLeft) == "number" then sessionTimeLeft = timeLeft end
+  local playerInPit = IsPlayerInPit()
+  local sessionTimeBucket = sessionTimeLeft and math.floor(sessionTimeLeft / 1000) or nil
+  local capturedTimeBucket = liveSessionTimeLeft and math.floor(liveSessionTimeLeft / 1000) or nil
+  local sessionOver = nil
+  if ac.getSession then
+    local okSession, session = pcall(ac.getSession, sim.currentSessionIndex)
+    if okSession and session then
+      local okOver, over = pcall(function() return session.isOver end)
+      if okOver then sessionOver = over end
+    end
+  end
+  local resultsVisible = nil
+  local okResults, results = pcall(function() return sim.isLookingAtSessionResults end)
+  if okResults then resultsVisible = results end
+  local sessionName = ""
+  local okName, name = pcall(function() return ac.getSessionName(sim.currentSessionIndex) end)
+  if okName and type(name) == "string" then sessionName = name end
+
+  local parts = {
+    tostring(sim.isSessionStarted),
+    tostring(lastSessionStarted),
+    tostring(sim.currentSessionIndex),
+    tostring(lastSessionIndex),
+    tostring(driverCount),
+    tostring(sessionName),
+    tostring(sessionType),
+    tostring(sim.raceSessionType),
+    tostring(sessionTimeBucket),
+    tostring(playerInPit),
+    tostring(capturedTimeBucket),
+    tostring(liveSessionHadCountdown),
+    tostring(sessionOver),
+    tostring(resultsVisible),
+    tostring(sessionEnded),
+    tostring(sessionBegan),
+    tostring(sessionSwitched),
+    tostring(liveSessionType),
+    tostring(liveSessionKey),
+    tostring(liveSessionCarCount),
+    tostring(liveSessionPending),
+    tostring(resultResetAfterExport),
+    tostring(resultExportEnabled),
+  }
+  local signature = table.concat(parts, "|")
+  if signature ~= lastExportDiagnostic then
+    lastExportDiagnostic = signature
+    Log(sFormat(
+      "EXPORT: state started=%s prevStarted=%s index=%s prevIndex=%s cars=%d name='%s' " ..
+      "sessionType=%s raceType=%s leftMs=%s playerInPit=%s capturedLeftMs=%s hadCountdown=%s " ..
+      "over=%s results=%s ended=%s began=%s switched=%s liveType=%s liveKey=%s " ..
+      "snapshotCars=%d pending=%s deferredReset=%s enabled=%s",
+      tostring(sim.isSessionStarted), tostring(lastSessionStarted),
+      tostring(sim.currentSessionIndex), tostring(lastSessionIndex), driverCount,
+      sessionName, tostring(sessionType), tostring(sim.raceSessionType),
+      tostring(sessionTimeLeft), tostring(playerInPit), tostring(liveSessionTimeLeft),
+      tostring(liveSessionHadCountdown), tostring(sessionOver), tostring(resultsVisible),
+      tostring(sessionEnded), tostring(sessionBegan), tostring(sessionSwitched),
+      tostring(liveSessionType), tostring(liveSessionKey), liveSessionCarCount,
+      tostring(liveSessionPending), tostring(resultResetAfterExport),
+      tostring(resultExportEnabled)))
+  end
+end
+
+-- Process the export-related session transitions in one place so their ordering is
+-- testable. If the session ends on the same frame that AC switches to its pit/garage
+-- session, retain and export the ended session snapshot instead of clearing it as a new
+-- session. A later session begin/switch still resets the previous export state.
+local function UpdateResultExportFrame(sim)
+  local sessionSwitched = lastSessionIndex ~= nil
+                        and lastSessionIndex ~= sim.currentSessionIndex
+  local currentSessionKey = GetCurrentSessionKey(sim)
+  local currentSessionFolder = SessionTypeToFolder(ReadLiveSessionType(sim))
+  local sessionTimeLeft = nil
+  local okTimeLeft, timeLeft = pcall(function() return sim.sessionTimeLeft end)
+  if okTimeLeft and type(timeLeft) == "number" then sessionTimeLeft = timeLeft end
+  local playerInPit = IsPlayerInPit()
+  local switchedAwayFromTrackedSession = sessionSwitched
+                        and liveSessionType ~= nil
+                        and liveSessionKey ~= nil
+                        and currentSessionKey ~= liveSessionKey
+  local sessionName = GetSessionNameLower(sim)
+  local lostTrackedSessionData = driverCount <= 0
+                        and liveSessionType ~= nil
+                        and liveSessionCarCount > 0
+                        and (currentSessionFolder == nil or sessionName == "")
+  local timedSessionExpiredInPit = liveSessionType ~= nil
+                        and liveSessionHadCountdown
+                        and sessionTimeLeft ~= nil
+                        and sessionTimeLeft <= 0
+                        and playerInPit == true
+  local endSignal = (lastSessionStarted == true and sim.isSessionStarted ~= true)
+                        or switchedAwayFromTrackedSession
+                        or lostTrackedSessionData
+                        or timedSessionExpiredInPit
+  local sessionNeedsExport = liveSessionType ~= nil
+                        and (liveSessionPending or exportedSessionKey ~= liveSessionKey)
+  local sessionEnded = endSignal and sessionNeedsExport
+  local sessionBegan = lastSessionStarted ~= nil and lastSessionStarted == false
+                        and sim.isSessionStarted == true and lastSessionIndex ~= nil
+  local newlyEnded = sessionEnded and not liveSessionPending
+  local sessionChanged = newlyEnded or sessionBegan or sessionSwitched
+
+  LogExportState(sim, sessionEnded, sessionBegan, sessionSwitched)
+
+  if sessionEnded then
+    -- Refresh the old snapshot only if AC is still showing that same session. If the
+    -- index already moved, the live cars belong to the incoming state (or are gone).
+    if not sessionSwitched and driverCount > 0 then
+      local ok, err = pcall(CaptureLiveCarResults)
+      if not ok then Log("EXPORT: final car snapshot failed: " .. tostring(err)) end
+    end
+    ArmSessionEnded()
+    if sessionSwitched or sessionBegan then
+      resultResetAfterExport = true
+    end
+    CheckForFinishedSessionSafely(sim)
+  elseif sessionBegan or sessionSwitched then
+    if liveSessionPending then
+      -- Don't discard a result that still needs retries just because AC began its next
+      -- session. Finish exporting the previous snapshot first.
+      resultResetAfterExport = true
+      CheckForFinishedSessionSafely(sim)
+    else
+      ResetResultExport()
+      resultResetAfterExport = false
+      CaptureLiveSessionSafely(sim)
+    end
+  elseif resultResetAfterExport then
+    CheckForFinishedSessionSafely(sim)
+  else
+    CaptureLiveSessionSafely(sim)
+    CheckForFinishedSessionSafely(sim)
+  end
+
+  if resultResetAfterExport and not liveSessionPending then
+    ResetResultExport()
+    resultResetAfterExport = false
+    if sim.isSessionStarted == true then
+      CaptureLiveSessionSafely(sim)
+    end
+  end
+
+  lastSessionIndex = sim.currentSessionIndex
+  lastSessionStarted = sim.isSessionStarted
+  return sessionChanged, sessionEnded, sessionBegan, sessionSwitched
 end
 
 local function CheckSessionValidity()
@@ -1290,25 +1922,66 @@ function script.update(dt)
   local sim = ac.getSim()
   driverCount = sim.carsCount or 0
 
-  local sessionChanged = false
-  if lastSessionIndex ~= nil and lastSessionIndex ~= sim.currentSessionIndex then
-    sessionChanged = true
+  -- Log the incoming state before any export-side API calls. If the transition handler
+  -- encounters an AC/CSP state object that is no longer valid after cars disappear, this
+  -- entry still records the zero-car state that led to the failure.
+  local entryOk, entryLine = pcall(function()
+    local sessionName = ""
+    local okName, name = pcall(function() return ac.getSessionName(sim.currentSessionIndex) end)
+    if okName and type(name) == "string" then sessionName = name end
+
+    local sessionType, sessionOver = nil, nil
+    if ac.getSession then
+      local okSession, session = pcall(ac.getSession, sim.currentSessionIndex)
+      if okSession and session then
+        local okType, value = pcall(function() return session.type end)
+        if okType then sessionType = value end
+        local okOver, over = pcall(function() return session.isOver end)
+        if okOver then sessionOver = over end
+      end
+    end
+
+    local resultsVisible = nil
+    local okResults, results = pcall(function() return sim.isLookingAtSessionResults end)
+    if okResults then resultsVisible = results end
+    local sessionTimeLeft = nil
+    local okTimeLeft, timeLeft = pcall(function() return sim.sessionTimeLeft end)
+    if okTimeLeft and type(timeLeft) == "number" then sessionTimeLeft = timeLeft end
+    local sessionTimeBucket = sessionTimeLeft and math.floor(sessionTimeLeft / 1000) or nil
+    local playerInPit = IsPlayerInPit()
+
+    return sFormat(
+      "EXPORT: update-entry started=%s prevStarted=%s index=%s prevIndex=%s cars=%d " ..
+      "name='%s' sessionType=%s raceType=%s leftSec=%s playerInPit=%s over=%s results=%s",
+      tostring(sim.isSessionStarted), tostring(lastSessionStarted),
+      tostring(sim.currentSessionIndex), tostring(lastSessionIndex), driverCount,
+      sessionName, tostring(sessionType), tostring(sim.raceSessionType),
+      tostring(sessionTimeBucket), tostring(playerInPit),
+      tostring(sessionOver), tostring(resultsVisible))
+  end)
+  if entryOk and entryLine ~= lastExportUpdateDiagnostic then
+    lastExportUpdateDiagnostic = entryLine
+    Log(entryLine)
+  elseif not entryOk then
+    Log("EXPORT: update-entry diagnostics failed: " .. tostring(entryLine))
   end
-  if lastSessionStarted ~= nil and lastSessionStarted == true and sim.isSessionStarted == false then
-    sessionChanged = true
-  end
-  if lastSessionStarted ~= nil and lastSessionStarted == false and sim.isSessionStarted == true and lastSessionIndex ~= nil then
-    sessionChanged = true
+
+  local updateOk, sessionChanged = pcall(UpdateResultExportFrame, sim)
+  if not updateOk then
+    local message = tostring(sessionChanged)
+    if message ~= lastExportTransitionError then
+      Log("EXPORT: transition handler failed: " .. message)
+      lastExportTransitionError = message
+    end
+    sessionChanged = false
+  else
+    lastExportTransitionError = nil
   end
   if sessionChanged then
     firstFrame = true
     carClassCache = {}
     uiSourceCache = {}
-    StopQualiPolling()
   end
-  lastSessionIndex = sim.currentSessionIndex
-  lastSessionStarted = sim.isSessionStarted
-
   if firstFrame then
     -- Cleared before the work runs: if anything below throws, the flag stays false so a
     -- single failure cannot turn into a per-frame infinite loop.
@@ -1356,13 +2029,6 @@ function script.update(dt)
 
   if sim.isInMainMenu == true then
     ac.setWindowOpen("cl_config", true)
-  end
-
-  local shouldPoll = qualiSaveEnabled and IsQualiPracticeMode() and sim.isInMainMenu ~= true
-  if shouldPoll and not qualiPollTimer then
-    StartQualiPolling()
-  elseif not shouldPoll and qualiPollTimer then
-    StopQualiPolling()
   end
 
   local valid, _ = CheckSessionValidity()
@@ -1421,72 +2087,74 @@ function script.clConfig()
   ui.drawLine(vec2(colX, separatorY), vec2(w - 24, separatorY), rgbm(0.25, 0.25, 0.28, 0.5), 1)
   ui.setCursor(vec2(colX, separatorY + 12))
 
-  if not IsRaceMode() then
-    if ui.checkbox("Auto-save Qualifying/Practice best-lap results (every second)", qualiSaveEnabled) then
-      qualiSaveEnabled = not qualiSaveEnabled
-      storedSettings.qualiSaveEnabled = qualiSaveEnabled
-      RestartQualiPolling()
+  -- Available in Race, Practice and Qualifying alike.
+  if ui.checkbox("Auto-save session result when the session finishes", resultExportEnabled) then
+    resultExportEnabled = not resultExportEnabled
+    storedSettings.resultExportEnabled = resultExportEnabled
+    if not resultExportEnabled then
+      ResetResultExport()
     end
-
-    ui.setCursor(vec2(colX, ui.getCursor().y + 4))
-    if ui.button("Choose save folder...", vec2(w - 48, 28)) then
-      local dlgOk, dlgErr = pcall(function()
-        if type(os.openFileDialog) ~= "function" then
-          ui.toast(ui.Icons.Warning, "Folder dialog is not available on this CSP version.")
-        else
-          local defaultFolder = ac.getFolder and ac.getFolder(ac.FolderID.Documents) or ""
-          os.openFileDialog({
-            title = "Choose save folder for qualifying/practice results",
-            defaultFolder = defaultFolder,
-            folder = (qualiSaveFolder ~= "") and qualiSaveFolder or nil,
-            flags = os.DialogFlags and bit.bor(os.DialogFlags.PickFolders, os.DialogFlags.PathMustExist) or nil
-          }, function(err, path)
-            if (not err or err == "") and path and path ~= "" then
-              qualiSaveFolder = NormalizePath(path)
-              storedSettings.qualiSaveFolder = qualiSaveFolder
-              RestartQualiPolling()
-              ui.toast(ui.Icons.Play, "Quali result save folder set")
-            elseif err and err ~= "" then
-              ui.toast(ui.Icons.Warning, "Error choosing folder: " .. err)
-            end
-          end)
-        end
-      end)
-      if not dlgOk then
-        ui.toast(ui.Icons.Warning, "Error opening folder dialog: " .. tostring(dlgErr))
-      end
-    end
-
-    ui.setCursor(vec2(colX, ui.getCursor().y + 6))
-    ui.pushFont(ui.Font.Small)
-    if qualiSaveFolder ~= "" then
-      ui.textWrapped("Save folder: " .. qualiSaveFolder)
-      ui.setCursor(vec2(colX, ui.getCursor().y + 2))
-      if ui.button("Reset to Default (app folder)", vec2(230, 22)) then
-        qualiSaveFolder = ""
-        storedSettings.qualiSaveFolder = ""
-        RestartQualiPolling()
-      end
-    else
-      local resolved = QualiEffectiveFolder()
-      if resolved ~= "" then
-        ui.textColored("Save folder: " .. resolved .. " (default)", rgbm(0.6, 0.6, 0.7, 1))
-        if ui.itemHovered() then
-          ui.setTooltip("Default location (app folder). Click 'Choose save folder...' to change it.")
-        end
-      else
-        ui.textColored("Save folder: not resolved - please choose a folder", rgbm(1.0, 0.7, 0.35, 1))
-      end
-    end
-    ui.setCursor(vec2(colX, ui.getCursor().y + 2))
-    if qualiSaveStatus ~= "" then
-      ui.textWrapped(qualiSaveStatus)
-    else
-      ui.textColored("No session data saved yet.", rgbm(0.6, 0.6, 0.7, 1))
-    end
-    ui.popFont()
-    ui.dummy(vec2(0, 8))
   end
+
+  ui.setCursor(vec2(colX, ui.getCursor().y + 4))
+  if ui.button("Choose result folder...", vec2(w - 48, 28)) then
+    local dlgOk, dlgErr = pcall(function()
+      if type(os.openFileDialog) ~= "function" then
+        ui.toast(ui.Icons.Warning, "Folder dialog is not available on this CSP version.")
+      else
+        local defaultFolder = ac.getFolder and ac.getFolder(ac.FolderID.Documents) or ""
+        os.openFileDialog({
+          title = "Choose save folder for session results",
+          defaultFolder = defaultFolder,
+          folder = (resultFolder ~= "") and resultFolder or nil,
+          flags = os.DialogFlags and bit.bor(os.DialogFlags.PickFolders, os.DialogFlags.PathMustExist) or nil
+        }, function(err, path)
+          if (not err or err == "") and path and path ~= "" then
+            resultFolder = NormalizePath(path)
+            storedSettings.resultFolder = resultFolder
+            ui.toast(ui.Icons.Play, "Session result folder set")
+          elseif err and err ~= "" then
+            ui.toast(ui.Icons.Warning, "Error choosing folder: " .. err)
+          end
+        end)
+      end
+    end)
+    if not dlgOk then
+      ui.toast(ui.Icons.Warning, "Error opening folder dialog: " .. tostring(dlgErr))
+    end
+  end
+
+  ui.setCursor(vec2(colX, ui.getCursor().y + 6))
+  ui.pushFont(ui.Font.Small)
+  if resultFolder ~= "" then
+    ui.textWrapped("Result folder: " .. resultFolder)
+    ui.setCursor(vec2(colX, ui.getCursor().y + 2))
+    if ui.button("Reset to Default", vec2(230, 22)) then
+      resultFolder = ""
+      storedSettings.resultFolder = ""
+    end
+  else
+    local resolved = ResultEffectiveFolder()
+    if resolved ~= "" then
+      ui.textColored("Result folder: " .. resolved .. " (default)", rgbm(0.6, 0.6, 0.7, 1))
+      if ui.itemHovered() then
+        ui.setTooltip("Documents\\Assetto Corsa\\mcr-results, which is also the dashboard default. Click 'Choose result folder...' to change it.")
+      end
+    else
+      ui.textColored("Result folder: not resolved - please choose a folder", rgbm(1.0, 0.7, 0.35, 1))
+    end
+  end
+
+  ui.setCursor(vec2(colX, ui.getCursor().y + 2))
+  ui.textWrapped("Results are split into practice, qualifying and race subfolders. Point the dashboard's 'Lua App Result Path' at the same folder.")
+  ui.setCursor(vec2(colX, ui.getCursor().y + 2))
+  if resultExportStatus ~= "" then
+    ui.textWrapped(resultExportStatus)
+  else
+    ui.textColored("No session result saved yet.", rgbm(0.6, 0.6, 0.7, 1))
+  end
+  ui.popFont()
+  ui.dummy(vec2(0, 8))
 
   if valid then
     if ui.checkbox("Enable Multiple Class Race", enduranceEnabled) then
@@ -1590,8 +2258,21 @@ ac.onSessionStart(function()
   carClassCache       = {}
   allDriversStartingPos = {}
   uiSourceCache       = {}
-  StopQualiPolling()
+  if liveSessionPending then
+    resultResetAfterExport = true
+  else
+    ResetResultExport()
+    resultResetAfterExport = false
+  end
+  lastExportDiagnostic = nil
   Log("onSessionStart: firstFrame=true")
 end)
+
+if type(ac.onRelease) == "function" then
+  local okRelease, releaseErr = pcall(ac.onRelease, ExportExpiredSessionOnRelease)
+  if not okRelease then
+    Log("EXPORT: failed to register release fallback: " .. tostring(releaseErr))
+  end
+end
 
 Log("=== APP LOADED ===")
